@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code Execution Engine API</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+        }
+        .endpoint {
+            background: #f5f5f5;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+        }
+        .method {
+            font-weight: bold;
+            color: #0066cc;
+        }
+        .path {
+            font-family: monospace;
+            background: #e0e0e0;
+            padding: 2px 5px;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Code Execution Engine API</h1>
+    <p>Welcome to the Code Execution Engine API documentation. This API allows you to execute Python code in isolated containers with custom package dependencies.</p>
+    
+    <div class="endpoint">
+        <h2>Available Endpoints</h2>
+        <ul>
+            <li><span class="method">GET</span> <span class="path">/</span> - This documentation page</li>
+            <li><span class="method">POST</span> <span class="path">/containers</span> - Create a new container with specified packages</li>
+            <li><span class="method">GET</span> <span class="path">/containers</span> - List all active containers</li>
+            <li><span class="method">DELETE</span> <span class="path">/containers/{container_id}</span> - Delete a specific container</li>
+            <li><span class="method">POST</span> <span class="path">/execute</span> - Execute Python code in a container</li>
+            <li><span class="method">POST</span> <span class="path">/jobs</span> - Create a scheduled job</li>
+            <li><span class="method">GET</span> <span class="path">/jobs</span> - List all scheduled jobs</li>
+            <li><span class="method">GET</span> <span class="path">/logs</span> - Get execution logs</li>
+        </ul>
+    </div>
+
+    <p>For detailed API documentation, please visit the <a href="/docs">Swagger UI</a> or <a href="/redoc">ReDoc</a>.</p>
+</body>
+</html> 
