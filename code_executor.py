@@ -169,7 +169,8 @@ USER codeuser
         
         # Create a temporary file with the code
         temp_file = f"/tmp/code_{int(time.time())}.py"
-        write_command = f"echo '{code.replace("'", "'\\''")}' > {temp_file}"
+        escaped_code = code.replace("'", "'\\''")
+        write_command = f"echo '{escaped_code}' > {temp_file}"
         success, _, error = self._execute_with_timeout(container_id, write_command, timeout)
         if not success:
             return {

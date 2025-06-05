@@ -197,7 +197,8 @@ async def execute_code(request: CodeExecutionRequest):
             
             # Create a temporary file with the code
             temp_file = f"/tmp/code_{int(time.time())}.py"
-            write_command = f"echo '{request.code.replace("'", "'\\''")}' > {temp_file}"
+            escaped_code = request.code.replace("'", "'\\''")
+            write_command = f"echo '{escaped_code}' > {temp_file}"
             try:
                 write_result = container.exec_run(write_command, timeout=request.timeout)
                 if write_result.exit_code != 0:
