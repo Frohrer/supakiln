@@ -430,7 +430,15 @@ async def get_execution_logs(
     if job_id is not None:
         query = query.filter(ExecutionLog.job_id == job_id)
     logs = query.order_by(ExecutionLog.started_at.desc()).offset(offset).limit(limit).all()
-    return logs
+    
+    # Convert logs to response format with datetime as ISO string
+    return [
+        {
+            **log.__dict__,
+            'started_at': log.started_at.isoformat() if log.started_at else None
+        }
+        for log in logs
+    ]
 
 @app.get("/logs/{log_id}", response_model=ExecutionLogResponse)
 async def get_execution_log(log_id: int, db: Session = Depends(get_db)):
@@ -438,7 +446,12 @@ async def get_execution_log(log_id: int, db: Session = Depends(get_db)):
     log = db.query(ExecutionLog).filter(ExecutionLog.id == log_id).first()
     if not log:
         raise HTTPException(status_code=404, detail="Log not found")
-    return log
+    
+    # Convert log to response format with datetime as ISO string
+    return {
+        **log.__dict__,
+        'started_at': log.started_at.isoformat() if log.started_at else None
+    }
 
 if __name__ == "__main__":
     # Create static directory if it doesn't exist
