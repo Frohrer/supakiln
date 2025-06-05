@@ -19,6 +19,7 @@ import {
   DialogContent,
   DialogActions,
 } from '@mui/material';
+import api from '../config/api';
 
 interface Log {
   id: string;
@@ -39,11 +40,14 @@ const Logs: React.FC = () => {
 
   const fetchLogs = async () => {
     try {
-      const response = await fetch(
-        `http://localhost:8000/logs?page=${page}&job=${jobFilter}&status=${statusFilter}`
-      );
-      const data = await response.json();
-      setLogs(data);
+      const response = await api.get(`/logs`, {
+        params: {
+          page,
+          job: jobFilter,
+          status: statusFilter,
+        },
+      });
+      setLogs(response.data);
     } catch (error) {
       console.error('Error fetching logs:', error);
     }

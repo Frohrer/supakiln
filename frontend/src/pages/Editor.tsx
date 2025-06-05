@@ -32,8 +32,7 @@ const CodeEditor: React.FC = () => {
         container_id: selectedContainer || undefined,
       });
 
-      const data = response.data;
-      setOutput(data.output || data.error || '');
+      setOutput(response.data.output || response.data.error || '');
     } catch (error) {
       setOutput('Error executing code: ' + (error as Error).message);
     }
