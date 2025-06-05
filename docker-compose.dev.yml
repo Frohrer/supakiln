@@ -7,9 +7,6 @@ services:
       dockerfile: Dockerfile.dev
     ports:
       - "3000:3000"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
     environment:
       - NODE_ENV=development
     command: npm run dev
@@ -21,7 +18,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/app
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DOCKER_HOST=unix:///var/run/docker.sock
