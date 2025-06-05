@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import uvicorn
@@ -15,24 +14,24 @@ import time
 
 app = FastAPI(title="Code Execution Engine API")
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=3600,
-)
-
 @app.middleware("http")
 async def add_cors_headers(request, call_next):
     response = await call_next(request)
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
+
+@app.options("/execute")
+async def options_execute():
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        }
+    )
 
 # Mount static files - update the path to be relative to the current file
 static_dir = os.path.join(os.path.dirname(__file__), "static")
@@ -188,10 +187,6 @@ async def delete_container(container_id: str):
         raise HTTPException(status_code=404, detail="Container not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.options("/execute")
-async def options_execute():
-    return {}
 
 @app.post("/execute")
 async def execute_code(request: CodeExecutionRequest):
