@@ -32,7 +32,8 @@ COPY . .
 
 # Set proper permissions for Docker socket and app directory
 RUN chown -R codeuser:docker /app && \
-    chmod 660 /var/run/docker.sock || true
+    chmod 660 /var/run/docker.sock || true && \
+    chmod 775 /var/run/docker.sock || true
 
 # Switch to non-root user
 USER codeuser
