@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Box, Grid, Paper, Typography, Button, TextField, IconButton } from '@mui/material';
 import { Add as AddIcon, Delete as DeleteIcon } from '@mui/icons-material';
 import Editor from '@monaco-editor/react';
+import api from '../config/api';
 
 const CodeEditor: React.FC = () => {
   const [code, setCode] = useState('# Write your Python code here\nprint("Hello, World!")');
@@ -25,19 +26,13 @@ const CodeEditor: React.FC = () => {
 
   const handleRunCode = async () => {
     try {
-      const response = await fetch('http://localhost:8000/execute', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          code,
-          packages: packages.filter(p => p.trim() !== ''),
-          container_id: selectedContainer || undefined,
-        }),
+      const response = await api.post('/execute', {
+        code,
+        packages: packages.filter(p => p.trim() !== ''),
+        container_id: selectedContainer || undefined,
       });
 
-      const data = await response.json();
+      const data = response.data;
       setOutput(data.output || data.error || '');
     } catch (error) {
       setOutput('Error executing code: ' + (error as Error).message);
