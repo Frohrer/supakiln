@@ -180,12 +180,13 @@ async def delete_container(container_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/execute")
-async def execute_code(request: CodeExecutionRequest):
+async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_db)):
     """
     Execute Python code in a container.
     If container_id is provided, use that container.
     Otherwise, create a new container with the specified packages.
     """
+    start_time = time.time()
     try:
         if request.container_id:
             # Verify container exists
@@ -202,10 +203,21 @@ async def execute_code(request: CodeExecutionRequest):
             try:
                 write_result = container.exec_run(write_command, timeout=request.timeout)
                 if write_result.exit_code != 0:
+                    error_msg = f"Failed to write code to file: {write_result.output.decode()}"
+                    # Log the error
+                    log = ExecutionLog(
+                        code=request.code,
+                        error=error_msg,
+                        container_id=request.container_id,
+                        execution_time=time.time() - start_time,
+                        status='error'
+                    )
+                    db.add(log)
+                    db.commit()
                     return {
                         "success": False,
                         "output": None,
-                        "error": f"Failed to write code to file: {write_result.output.decode()}",
+                        "error": error_msg,
                         "container_id": request.container_id,
                         "container_name": container_names.get(request.container_id, "Unnamed")
                     }
@@ -219,10 +231,26 @@ async def execute_code(request: CodeExecutionRequest):
                 # Clean up the temporary file
                 container.exec_run(f"rm {temp_file}", timeout=5)
                 
+                success = exec_result.exit_code == 0
+                output = exec_result.output.decode()
+                error = None if success else output
+                
+                # Log the execution
+                log = ExecutionLog(
+                    code=request.code,
+                    output=output if success else None,
+                    error=error,
+                    container_id=request.container_id,
+                    execution_time=time.time() - start_time,
+                    status='success' if success else 'error'
+                )
+                db.add(log)
+                db.commit()
+                
                 return {
-                    "success": exec_result.exit_code == 0,
-                    "output": exec_result.output.decode(),
-                    "error": None if exec_result.exit_code == 0 else exec_result.output.decode(),
+                    "success": success,
+                    "output": output,
+                    "error": error,
                     "container_id": request.container_id,
                     "container_name": container_names.get(request.container_id, "Unnamed")
                 }
@@ -240,10 +268,22 @@ async def execute_code(request: CodeExecutionRequest):
                 except Exception:
                     pass
                 
+                error_msg = str(e)
+                # Log the error
+                log = ExecutionLog(
+                    code=request.code,
+                    error=error_msg,
+                    container_id=request.container_id,
+                    execution_time=time.time() - start_time,
+                    status='error'
+                )
+                db.add(log)
+                db.commit()
+                
                 return {
                     "success": False,
                     "output": None,
-                    "error": str(e),
+                    "error": error_msg,
                     "container_id": request.container_id,
                     "container_name": container_names.get(request.container_id, "Unnamed")
                 }
@@ -272,14 +312,43 @@ async def execute_code(request: CodeExecutionRequest):
                     except Exception:
                         pass
             
+            # Log the execution
+            log = ExecutionLog(
+                code=request.code,
+                output=result.get('output'),
+                error=result.get('error'),
+                container_id=result.get('container_id'),
+                execution_time=time.time() - start_time,
+                status='success' if result.get('success') else 'error'
+            )
+            db.add(log)
+            db.commit()
+            
             return result
     except docker.errors.ImageNotFound:
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to build container image. Please ensure Docker is running and you have the necessary permissions."
+        error_msg = "Failed to build container image. Please ensure Docker is running and you have the necessary permissions."
+        # Log the error
+        log = ExecutionLog(
+            code=request.code,
+            error=error_msg,
+            execution_time=time.time() - start_time,
+            status='error'
         )
+        db.add(log)
+        db.commit()
+        raise HTTPException(status_code=500, detail=error_msg)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e)
+        # Log the error
+        log = ExecutionLog(
+            code=request.code,
+            error=error_msg,
+            execution_time=time.time() - start_time,
+            status='error'
+        )
+        db.add(log)
+        db.commit()
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @app.delete("/containers")
 async def cleanup_all():

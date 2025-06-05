@@ -18,17 +18,20 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
+  SelectChangeEvent,
 } from '@mui/material';
 import api from '../config/api';
 
 interface Log {
-  id: string;
-  timestamp: string;
-  jobName: string;
+  id: number;
+  job_id: number | null;
+  code: string;
+  output: string | null;
+  error: string | null;
+  container_id: string | null;
+  execution_time: number;
+  started_at: string;
   status: string;
-  duration: string;
-  output: string;
-  error: string;
 }
 
 const Logs: React.FC = () => {
@@ -37,17 +40,20 @@ const Logs: React.FC = () => {
   const [jobFilter, setJobFilter] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<string>('');
   const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(true);
 
   const fetchLogs = async () => {
     try {
       const response = await api.get(`/logs`, {
         params: {
-          page,
-          job: jobFilter,
-          status: statusFilter,
+          limit: 10,
+          offset: (page - 1) * 10,
+          job_id: jobFilter || undefined,
+          status: statusFilter || undefined,
         },
       });
-      setLogs(response.data);
+      setLogs((prevLogs: Log[]) => page === 1 ? response.data : [...prevLogs, ...response.data]);
+      setHasMore(response.data.length === 10);
     } catch (error) {
       console.error('Error fetching logs:', error);
     }
@@ -69,6 +75,16 @@ const Logs: React.FC = () => {
     setSelectedLog(null);
   };
 
+  const handleJobFilterChange = (event: SelectChangeEvent) => {
+    setJobFilter(event.target.value);
+    setPage(1);
+  };
+
+  const handleStatusFilterChange = (event: SelectChangeEvent) => {
+    setStatusFilter(event.target.value);
+    setPage(1);
+  };
+
   return (
     <Box>
       <Paper sx={{ p: 2, mb: 3 }}>
@@ -78,7 +94,7 @@ const Logs: React.FC = () => {
             <Select
               value={jobFilter}
               label="Job"
-              onChange={(e) => setJobFilter(e.target.value)}
+              onChange={handleJobFilterChange}
             >
               <MenuItem value="">All Jobs</MenuItem>
               {/* Add job options dynamically */}
@@ -89,7 +105,7 @@ const Logs: React.FC = () => {
             <Select
               value={statusFilter}
               label="Status"
-              onChange={(e) => setStatusFilter(e.target.value)}
+              onChange={handleStatusFilterChange}
             >
               <MenuItem value="">All Statuses</MenuItem>
               <MenuItem value="success">Success</MenuItem>
@@ -103,9 +119,9 @@ const Logs: React.FC = () => {
             <TableHead>
               <TableRow>
                 <TableCell>Time</TableCell>
-                <TableCell>Job</TableCell>
+                <TableCell>Job ID</TableCell>
                 <TableCell>Status</TableCell>
-                <TableCell>Duration</TableCell>
+                <TableCell>Duration (s)</TableCell>
                 <TableCell>Actions</TableCell>
               </TableRow>
             </TableHead>
@@ -116,10 +132,10 @@ const Logs: React.FC = () => {
                   onClick={() => handleLogClick(log)}
                   sx={{ cursor: 'pointer' }}
                 >
-                  <TableCell>{new Date(log.timestamp).toLocaleString()}</TableCell>
-                  <TableCell>{log.jobName}</TableCell>
+                  <TableCell>{new Date(log.started_at).toLocaleString()}</TableCell>
+                  <TableCell>{log.job_id || 'Manual'}</TableCell>
                   <TableCell>{log.status}</TableCell>
-                  <TableCell>{log.duration}</TableCell>
+                  <TableCell>{log.execution_time.toFixed(2)}</TableCell>
                   <TableCell>
                     <Button size="small" variant="outlined">
                       View Details
@@ -130,11 +146,13 @@ const Logs: React.FC = () => {
             </TableBody>
           </Table>
         </TableContainer>
-        <Box sx={{ mt: 2, display: 'flex', justifyContent: 'center' }}>
-          <Button variant="outlined" onClick={handleLoadMore}>
-            Load More
-          </Button>
-        </Box>
+        {hasMore && (
+          <Box sx={{ mt: 2, display: 'flex', justifyContent: 'center' }}>
+            <Button variant="outlined" onClick={handleLoadMore}>
+              Load More
+            </Button>
+          </Box>
+        )}
       </Paper>
 
       <Dialog
@@ -160,9 +178,27 @@ const Logs: React.FC = () => {
                     overflow: 'auto',
                   }}
                 >
-                  <pre>{selectedLog.output}</pre>
+                  <pre>{selectedLog.code}</pre>
                 </Paper>
               </Box>
+              {selectedLog.output && (
+                <Box sx={{ mt: 2 }}>
+                  <Typography variant="h6" gutterBottom>
+                    Output
+                  </Typography>
+                  <Paper
+                    sx={{
+                      p: 2,
+                      bgcolor: 'background.paper',
+                      borderRadius: 1,
+                      maxHeight: '200px',
+                      overflow: 'auto',
+                    }}
+                  >
+                    <pre>{selectedLog.output}</pre>
+                  </Paper>
+                </Box>
+              )}
               {selectedLog.error && (
                 <Box sx={{ mt: 2 }}>
                   <Typography variant="h6" gutterBottom>
