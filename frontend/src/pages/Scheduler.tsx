@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Grid,
   Paper,
@@ -14,20 +14,23 @@ import {
   IconButton,
 } from '@mui/material';
 import { Delete as DeleteIcon, PlayArrow as PlayIcon } from '@mui/icons-material';
+import api from '../config/api';
 
 interface ScheduledJob {
   id: string;
   name: string;
-  schedule: string;
-  lastRun: string;
-  status: string;
+  cronExpression: string;
+  code: string;
+  lastRun: string | null;
+  nextRun: string | null;
+  isActive: boolean;
 }
 
 const Scheduler: React.FC = () => {
   const [jobs, setJobs] = useState<ScheduledJob[]>([]);
   const [newJob, setNewJob] = useState({
     name: '',
-    schedule: '',
+    cronExpression: '',
     code: '',
     packages: [''],
   });
@@ -58,48 +61,40 @@ const Scheduler: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const response = await fetch('http://localhost:8000/schedule', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: newJob.name,
-          schedule: newJob.schedule,
-          code: newJob.code,
-          packages: newJob.packages.filter(p => p.trim() !== ''),
-        }),
+      await api.post('/jobs', newJob);
+      setNewJob({
+        name: '',
+        cronExpression: '',
+        code: '',
+        packages: [''],
       });
-
-      if (response.ok) {
-        // Refresh jobs list
-        fetchJobs();
-        // Reset form
-        setNewJob({
-          name: '',
-          schedule: '',
-          code: '',
-          packages: [''],
-        });
-      }
+      fetchJobs();
     } catch (error) {
-      console.error('Error scheduling job:', error);
+      console.error('Error creating job:', error);
     }
   };
 
   const fetchJobs = async () => {
     try {
-      const response = await fetch('http://localhost:8000/jobs');
-      const data = await response.json();
-      setJobs(data);
+      const response = await api.get('/jobs');
+      setJobs(response.data);
     } catch (error) {
       console.error('Error fetching jobs:', error);
     }
   };
 
-  React.useEffect(() => {
+  useEffect(() => {
     fetchJobs();
   }, []);
+
+  const handleDelete = async (id: string) => {
+    try {
+      await api.delete(`/jobs/${id}`);
+      fetchJobs();
+    } catch (error) {
+      console.error('Error deleting job:', error);
+    }
+  };
 
   return (
     <Grid container spacing={3}>
@@ -123,14 +118,14 @@ const Scheduler: React.FC = () => {
                 {jobs.map((job) => (
                   <TableRow key={job.id}>
                     <TableCell>{job.name}</TableCell>
-                    <TableCell>{job.schedule}</TableCell>
+                    <TableCell>{job.cronExpression}</TableCell>
                     <TableCell>{job.lastRun}</TableCell>
-                    <TableCell>{job.status}</TableCell>
+                    <TableCell>{job.isActive ? 'Active' : 'Inactive'}</TableCell>
                     <TableCell>
                       <IconButton size="small" color="primary">
                         <PlayIcon />
                       </IconButton>
-                      <IconButton size="small" color="error">
+                      <IconButton size="small" color="error" onClick={() => handleDelete(job.id)}>
                         <DeleteIcon />
                       </IconButton>
                     </TableCell>
@@ -158,8 +153,8 @@ const Scheduler: React.FC = () => {
             <TextField
               fullWidth
               label="Cron Schedule"
-              value={newJob.schedule}
-              onChange={(e) => setNewJob({ ...newJob, schedule: e.target.value })}
+              value={newJob.cronExpression}
+              onChange={(e) => setNewJob({ ...newJob, cronExpression: e.target.value })}
               margin="normal"
               required
               placeholder="* * * * *"
