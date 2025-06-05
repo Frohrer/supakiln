@@ -21,7 +21,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
     expose_headers=["*"],
     max_age=3600,
 )
@@ -180,6 +180,10 @@ async def delete_container(container_id: str):
         raise HTTPException(status_code=404, detail="Container not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.options("/execute")
+async def options_execute():
+    return {}
 
 @app.post("/execute")
 async def execute_code(request: CodeExecutionRequest):
