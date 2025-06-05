@@ -194,13 +194,29 @@ async def execute_code(request: CodeExecutionRequest):
             
             # Execute in existing container
             container = executor.client.containers.get(request.container_id)
-            exec_command = f"python3 -c '{request.code}'"
             
+            # Create a temporary file with the code
+            temp_file = f"/tmp/code_{int(time.time())}.py"
+            write_command = f"echo '{request.code.replace("'", "'\\''")}' > {temp_file}"
             try:
+                write_result = container.exec_run(write_command, timeout=request.timeout)
+                if write_result.exit_code != 0:
+                    return {
+                        "success": False,
+                        "output": None,
+                        "error": f"Failed to write code to file: {write_result.output.decode()}",
+                        "container_id": request.container_id,
+                        "container_name": container_names.get(request.container_id, "Unnamed")
+                    }
+                
+                # Execute the code file
                 exec_result = container.exec_run(
-                    exec_command,
+                    f"python3 {temp_file}",
                     timeout=request.timeout
                 )
+                
+                # Clean up the temporary file
+                container.exec_run(f"rm {temp_file}", timeout=5)
                 
                 return {
                     "success": exec_result.exit_code == 0,
@@ -210,6 +226,19 @@ async def execute_code(request: CodeExecutionRequest):
                     "container_name": container_names.get(request.container_id, "Unnamed")
                 }
             except Exception as e:
+                # Clean up container on error
+                try:
+                    container.stop()
+                    container.remove()
+                    # Remove from our tracking
+                    for package_hash, cid in list(executor.containers.items()):
+                        if cid == request.container_id:
+                            del executor.containers[package_hash]
+                    if request.container_id in container_names:
+                        del container_names[request.container_id]
+                except Exception:
+                    pass
+                
                 return {
                     "success": False,
                     "output": None,
@@ -224,6 +253,24 @@ async def execute_code(request: CodeExecutionRequest):
                 packages=request.packages or [],
                 timeout=request.timeout
             )
+            
+            # If execution failed or timed out, clean up the container
+            if not result.get("success"):
+                container_id = result.get("container_id")
+                if container_id:
+                    try:
+                        container = executor.client.containers.get(container_id)
+                        container.stop()
+                        container.remove()
+                        # Remove from our tracking
+                        for package_hash, cid in list(executor.containers.items()):
+                            if cid == container_id:
+                                del executor.containers[package_hash]
+                        if container_id in container_names:
+                            del container_names[container_id]
+                    except Exception:
+                        pass
+            
             return result
     except docker.errors.ImageNotFound:
         raise HTTPException(

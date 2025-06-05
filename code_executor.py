@@ -120,8 +120,13 @@ USER codeuser
                 return True, result.stdout, None
             return False, None, result.stderr
         except subprocess.TimeoutExpired:
-            # Kill the container
+            # Kill and remove the container
             subprocess.run(["docker", "kill", container_id], capture_output=True)
+            subprocess.run(["docker", "rm", container_id], capture_output=True)
+            # Remove from our tracking
+            for package_hash, cid in list(self.containers.items()):
+                if cid == container_id:
+                    del self.containers[package_hash]
             return False, None, f"Execution timed out after {timeout} seconds"
         except Exception as e:
             return False, None, str(e)
@@ -162,11 +167,24 @@ USER codeuser
         
         container_id = self.containers[package_hash]
         
-        # Prepare code execution
-        exec_command = f"python3 -c '{code}'"
+        # Create a temporary file with the code
+        temp_file = f"/tmp/code_{int(time.time())}.py"
+        write_command = f"echo '{code.replace("'", "'\\''")}' > {temp_file}"
+        success, _, error = self._execute_with_timeout(container_id, write_command, timeout)
+        if not success:
+            return {
+                "success": False,
+                "output": None,
+                "error": f"Failed to write code to file: {error}"
+            }
         
-        # Execute with timeout
+        # Execute the code file
+        exec_command = f"python3 {temp_file}"
         success, output, error = self._execute_with_timeout(container_id, exec_command, timeout)
+        
+        # Clean up the temporary file
+        cleanup_command = f"rm {temp_file}"
+        self._execute_with_timeout(container_id, cleanup_command, timeout)
         
         return {
             "success": success,
