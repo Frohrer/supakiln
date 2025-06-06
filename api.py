@@ -253,17 +253,16 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             encoded_code = base64.b64encode(request.code.encode()).decode()
             
             # Create a Python script that will decode and execute the code
-            wrapper_script = f"""
-import base64
+            wrapper_script = '''import base64
 import sys
 
 # Decode the base64 encoded code
-encoded_code = '{encoded_code}'
+encoded_code = "{}"
 code = base64.b64decode(encoded_code).decode()
 
 # Execute the decoded code
 exec(code)
-"""
+'''.format(encoded_code.replace('"', '\\"'))
             
             # Write the wrapper script to the container
             write_command = f"echo '{wrapper_script}' > {temp_file}"
