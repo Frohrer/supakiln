@@ -246,59 +246,19 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             # Execute in existing container
             container = executor.client.containers.get(request.container_id)
             
-            # Create a temporary file with the code
-            temp_file = f"/tmp/code_{int(time.time())}.py"
-            
             # Encode the code in base64
             encoded_code = base64.b64encode(request.code.encode()).decode()
             
-            # Create a Python script that will decode and execute the code
-            wrapper_script = '''import base64
-import sys
-
-# Decode the base64 encoded code
-encoded_code = "{}"
-code = base64.b64decode(encoded_code).decode()
-
-# Execute the decoded code
-exec(code)
-'''.format(encoded_code.replace('"', '\\"'))
-            
-            # Write the wrapper script to the container
-            write_command = f"echo '{wrapper_script}' > {temp_file}"
             try:
-                write_result = container.exec_run(write_command, timeout=request.timeout)
-                if write_result.exit_code != 0:
-                    error_msg = f"Failed to write code to file: {write_result.output.decode()}"
-                    # Log the error
-                    log = ExecutionLog(
-                        code=request.code,  # Always include the code
-                        error=error_msg,
-                        container_id=request.container_id,
-                        execution_time=time.time() - start_time,
-                        status='error'
-                    )
-                    db.add(log)
-                    db.commit()
-                    return {
-                        "success": False,
-                        "output": None,
-                        "error": error_msg,
-                        "container_id": request.container_id,
-                        "container_name": container_names.get(request.container_id, "Unnamed")
-                    }
-                
-                # Save the code for future reference
-                container.exec_run(f"cp {temp_file} /tmp/code.py", timeout=5)
-                
-                # Execute the wrapper script
+                # Execute the code directly by piping base64 decoded content to python
                 exec_result = container.exec_run(
-                    f"python3 {temp_file}",
+                    f"echo '{encoded_code}' | base64 -d | python3",
                     timeout=request.timeout
                 )
                 
-                # Clean up the temporary file
-                container.exec_run(f"rm {temp_file}", timeout=5)
+                # Save the original code for future reference
+                escaped_code = base64.b64encode(request.code.encode()).decode()
+                container.exec_run(f"echo '{escaped_code}' | base64 -d > /tmp/code.py", timeout=5)
                 
                 success = exec_result.exit_code == 0
                 output = exec_result.output.decode()
