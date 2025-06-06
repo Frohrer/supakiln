@@ -3,8 +3,6 @@ import {
   Grid,
   Paper,
   Typography,
-  TextField,
-  Button,
   Table,
   TableBody,
   TableCell,
@@ -12,67 +10,31 @@ import {
   TableHead,
   TableRow,
   IconButton,
+  Button,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Box,
 } from '@mui/material';
-import { Delete as DeleteIcon, PlayArrow as PlayIcon } from '@mui/icons-material';
+import { Delete as DeleteIcon, PlayArrow as PlayIcon, Edit as EditIcon } from '@mui/icons-material';
 import api from '../config/api';
 
 interface ScheduledJob {
-  id: string;
+  id: number;
   name: string;
-  cronExpression: string;
+  cron_expression: string;
   code: string;
-  lastRun: string | null;
-  nextRun: string | null;
-  isActive: boolean;
+  last_run: string | null;
+  is_active: boolean;
+  container_id: string | null;
+  packages: string | null;
 }
 
 const Scheduler: React.FC = () => {
   const [jobs, setJobs] = useState<ScheduledJob[]>([]);
-  const [newJob, setNewJob] = useState({
-    name: '',
-    cronExpression: '',
-    code: '',
-    packages: [''],
-  });
-
-  const handleAddPackage = () => {
-    setNewJob({
-      ...newJob,
-      packages: [...newJob.packages, ''],
-    });
-  };
-
-  const handleRemovePackage = (index: number) => {
-    setNewJob({
-      ...newJob,
-      packages: newJob.packages.filter((_, i) => i !== index),
-    });
-  };
-
-  const handlePackageChange = (index: number, value: string) => {
-    const newPackages = [...newJob.packages];
-    newPackages[index] = value;
-    setNewJob({
-      ...newJob,
-      packages: newPackages,
-    });
-  };
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await api.post('/jobs', newJob);
-      setNewJob({
-        name: '',
-        cronExpression: '',
-        code: '',
-        packages: [''],
-      });
-      fetchJobs();
-    } catch (error) {
-      console.error('Error creating job:', error);
-    }
-  };
+  const [selectedJob, setSelectedJob] = useState<ScheduledJob | null>(null);
+  const [isViewDialogOpen, setIsViewDialogOpen] = useState(false);
 
   const fetchJobs = async () => {
     try {
@@ -87,7 +49,7 @@ const Scheduler: React.FC = () => {
     fetchJobs();
   }, []);
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: number) => {
     try {
       await api.delete(`/jobs/${id}`);
       fetchJobs();
@@ -96,9 +58,32 @@ const Scheduler: React.FC = () => {
     }
   };
 
+  const handleRunNow = async (job: ScheduledJob) => {
+    try {
+      await api.post('/execute', {
+        code: job.code,
+        packages: job.packages ? job.packages.split(',') : [],
+        container_id: job.container_id,
+      });
+      fetchJobs(); // Refresh to get updated last_run
+    } catch (error) {
+      console.error('Error running job:', error);
+    }
+  };
+
+  const handleViewJob = (job: ScheduledJob) => {
+    setSelectedJob(job);
+    setIsViewDialogOpen(true);
+  };
+
+  const handleCloseDialog = () => {
+    setIsViewDialogOpen(false);
+    setSelectedJob(null);
+  };
+
   return (
     <Grid container spacing={3}>
-      <Grid item xs={12} md={8}>
+      <Grid item xs={12}>
         <Paper sx={{ p: 2 }}>
           <Typography variant="h6" gutterBottom>
             Scheduled Jobs
@@ -118,14 +103,34 @@ const Scheduler: React.FC = () => {
                 {jobs.map((job) => (
                   <TableRow key={job.id}>
                     <TableCell>{job.name}</TableCell>
-                    <TableCell>{job.cronExpression}</TableCell>
-                    <TableCell>{job.lastRun}</TableCell>
-                    <TableCell>{job.isActive ? 'Active' : 'Inactive'}</TableCell>
+                    <TableCell>{job.cron_expression}</TableCell>
                     <TableCell>
-                      <IconButton size="small" color="primary">
+                      {job.last_run ? new Date(job.last_run).toLocaleString() : 'Never'}
+                    </TableCell>
+                    <TableCell>{job.is_active ? 'Active' : 'Inactive'}</TableCell>
+                    <TableCell>
+                      <IconButton
+                        size="small"
+                        color="primary"
+                        onClick={() => handleViewJob(job)}
+                        title="View Details"
+                      >
+                        <EditIcon />
+                      </IconButton>
+                      <IconButton
+                        size="small"
+                        color="primary"
+                        onClick={() => handleRunNow(job)}
+                        title="Run Now"
+                      >
                         <PlayIcon />
                       </IconButton>
-                      <IconButton size="small" color="error" onClick={() => handleDelete(job.id)}>
+                      <IconButton
+                        size="small"
+                        color="error"
+                        onClick={() => handleDelete(job.id)}
+                        title="Delete Job"
+                      >
                         <DeleteIcon />
                       </IconButton>
                     </TableCell>
@@ -136,79 +141,54 @@ const Scheduler: React.FC = () => {
           </TableContainer>
         </Paper>
       </Grid>
-      <Grid item xs={12} md={4}>
-        <Paper sx={{ p: 2 }}>
-          <Typography variant="h6" gutterBottom>
-            New Scheduled Job
-          </Typography>
-          <form onSubmit={handleSubmit}>
-            <TextField
-              fullWidth
-              label="Job Name"
-              value={newJob.name}
-              onChange={(e) => setNewJob({ ...newJob, name: e.target.value })}
-              margin="normal"
-              required
-            />
-            <TextField
-              fullWidth
-              label="Cron Schedule"
-              value={newJob.cronExpression}
-              onChange={(e) => setNewJob({ ...newJob, cronExpression: e.target.value })}
-              margin="normal"
-              required
-              placeholder="* * * * *"
-              helperText="Format: minute hour day month weekday"
-            />
-            <TextField
-              fullWidth
-              label="Python Code"
-              value={newJob.code}
-              onChange={(e) => setNewJob({ ...newJob, code: e.target.value })}
-              margin="normal"
-              required
-              multiline
-              rows={4}
-            />
-            <Typography variant="subtitle1" gutterBottom sx={{ mt: 2 }}>
-              Packages
-            </Typography>
-            {newJob.packages.map((package_, index) => (
-              <div key={index} style={{ display: 'flex', marginBottom: '8px' }}>
-                <TextField
-                  fullWidth
-                  size="small"
-                  value={package_}
-                  onChange={(e) => handlePackageChange(index, e.target.value)}
-                  placeholder="Package name"
-                />
-                <IconButton
-                  size="small"
-                  onClick={() => handleRemovePackage(index)}
-                  sx={{ ml: 1 }}
+
+      <Dialog
+        open={isViewDialogOpen}
+        onClose={handleCloseDialog}
+        maxWidth="md"
+        fullWidth
+      >
+        {selectedJob && (
+          <>
+            <DialogTitle>Job Details: {selectedJob.name}</DialogTitle>
+            <DialogContent>
+              <Box sx={{ mt: 2 }}>
+                <Typography variant="subtitle1" gutterBottom>
+                  Schedule: {selectedJob.cron_expression}
+                </Typography>
+                <Typography variant="subtitle1" gutterBottom>
+                  Last Run: {selectedJob.last_run ? new Date(selectedJob.last_run).toLocaleString() : 'Never'}
+                </Typography>
+                <Typography variant="subtitle1" gutterBottom>
+                  Status: {selectedJob.is_active ? 'Active' : 'Inactive'}
+                </Typography>
+                {selectedJob.packages && (
+                  <Typography variant="subtitle1" gutterBottom>
+                    Packages: {selectedJob.packages}
+                  </Typography>
+                )}
+                <Typography variant="h6" gutterBottom sx={{ mt: 2 }}>
+                  Code
+                </Typography>
+                <Paper
+                  sx={{
+                    p: 2,
+                    bgcolor: 'background.paper',
+                    borderRadius: 1,
+                    maxHeight: '300px',
+                    overflow: 'auto',
+                  }}
                 >
-                  <DeleteIcon />
-                </IconButton>
-              </div>
-            ))}
-            <Button
-              variant="outlined"
-              onClick={handleAddPackage}
-              sx={{ mt: 1 }}
-            >
-              Add Package
-            </Button>
-            <Button
-              type="submit"
-              variant="contained"
-              fullWidth
-              sx={{ mt: 2 }}
-            >
-              Schedule Job
-            </Button>
-          </form>
-        </Paper>
-      </Grid>
+                  <pre>{selectedJob.code}</pre>
+                </Paper>
+              </Box>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={handleCloseDialog}>Close</Button>
+            </DialogActions>
+          </>
+        )}
+      </Dialog>
     </Grid>
   );
 };

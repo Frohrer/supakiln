@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Box, Grid, Paper, Typography, Button, TextField, IconButton } from '@mui/material';
+import { Box, Grid, Paper, Typography, Button, TextField, IconButton, Switch, FormControlLabel } from '@mui/material';
 import { Add as AddIcon, Delete as DeleteIcon } from '@mui/icons-material';
 import Editor from '@monaco-editor/react';
 import api from '../config/api';
@@ -9,6 +9,9 @@ const CodeEditor: React.FC = () => {
   const [packages, setPackages] = useState<string[]>(['']);
   const [output, setOutput] = useState<string>('');
   const [selectedContainer, setSelectedContainer] = useState<string>('');
+  const [isScheduled, setIsScheduled] = useState(false);
+  const [scheduleName, setScheduleName] = useState('');
+  const [cronExpression, setCronExpression] = useState('');
 
   const handleAddPackage = () => {
     setPackages([...packages, '']);
@@ -26,15 +29,27 @@ const CodeEditor: React.FC = () => {
 
   const handleRunCode = async () => {
     try {
-      const response = await api.post('/execute', {
-        code,
-        packages: packages.filter(p => p.trim() !== ''),
-        container_id: selectedContainer || undefined,
-      });
-
-      setOutput(response.data.output || response.data.error || '');
+      if (isScheduled) {
+        // Create a scheduled job
+        await api.post('/jobs', {
+          name: scheduleName,
+          code,
+          cron_expression: cronExpression,
+          packages: packages.filter(p => p.trim() !== ''),
+          container_id: selectedContainer || undefined,
+        });
+        setOutput('Job scheduled successfully!');
+      } else {
+        // Execute code immediately
+        const response = await api.post('/execute', {
+          code,
+          packages: packages.filter(p => p.trim() !== ''),
+          container_id: selectedContainer || undefined,
+        });
+        setOutput(response.data.output || response.data.error || '');
+      }
     } catch (error) {
-      setOutput('Error executing code: ' + (error as Error).message);
+      setOutput('Error: ' + (error as Error).message);
     }
   };
 
@@ -99,13 +114,48 @@ const CodeEditor: React.FC = () => {
           >
             Add Package
           </Button>
+
+          <Box sx={{ mt: 3 }}>
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={isScheduled}
+                  onChange={(e) => setIsScheduled(e.target.checked)}
+                />
+              }
+              label="Schedule Job"
+            />
+            {isScheduled && (
+              <Box sx={{ mt: 2 }}>
+                <TextField
+                  fullWidth
+                  label="Job Name"
+                  value={scheduleName}
+                  onChange={(e) => setScheduleName(e.target.value)}
+                  margin="normal"
+                  required
+                />
+                <TextField
+                  fullWidth
+                  label="Cron Schedule"
+                  value={cronExpression}
+                  onChange={(e) => setCronExpression(e.target.value)}
+                  margin="normal"
+                  required
+                  placeholder="* * * * *"
+                  helperText="Format: minute hour day month weekday"
+                />
+              </Box>
+            )}
+          </Box>
+
           <Button
             variant="contained"
             fullWidth
             onClick={handleRunCode}
             sx={{ mt: 2 }}
           >
-            Run Code
+            {isScheduled ? 'Schedule Job' : 'Run Code'}
           </Button>
         </Paper>
         <Paper sx={{ p: 2 }}>
