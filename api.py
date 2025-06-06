@@ -52,6 +52,8 @@ class ContainerResponse(BaseModel):
     container_id: str
     name: str
     packages: List[str]
+    created_at: str
+    code: Optional[str] = None
 
 class ScheduledJobRequest(BaseModel):
     name: str
@@ -128,7 +130,8 @@ async def create_container(request: PackageInstallRequest):
         return ContainerResponse(
             container_id=container_id,
             name=request.name,
-            packages=request.packages
+            packages=request.packages,
+            created_at=container.attrs['Created']
         )
     except docker.errors.ImageNotFound:
         raise HTTPException(
@@ -153,11 +156,44 @@ async def list_containers():
             containers.append(ContainerResponse(
                 container_id=container_id,
                 name=container_names.get(container_id, "Unnamed"),
-                packages=packages
+                packages=packages,
+                created_at=container.attrs['Created']
             ))
         except Exception:
             continue
     return containers
+
+@app.get("/containers/{container_id}", response_model=ContainerResponse)
+async def get_container(container_id: str):
+    """
+    Get details of a specific container including its code.
+    """
+    try:
+        if container_id not in executor.containers.values():
+            raise HTTPException(status_code=404, detail="Container not found")
+        
+        container = executor.client.containers.get(container_id)
+        image_tag = container.image.tags[0]
+        packages = image_tag.split(":")[-1].split(",")
+        
+        # Try to get the code from the container
+        code = None
+        try:
+            result = container.exec_run("cat /tmp/code.py", timeout=5)
+            if result.exit_code == 0:
+                code = result.output.decode()
+        except Exception:
+            pass
+        
+        return ContainerResponse(
+            container_id=container_id,
+            name=container_names.get(container_id, "Unnamed"),
+            packages=packages,
+            created_at=container.attrs['Created'],
+            code=code
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/containers/{container_id}")
 async def delete_container(container_id: str):
@@ -234,6 +270,9 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                         "container_id": request.container_id,
                         "container_name": container_names.get(request.container_id, "Unnamed")
                     }
+                
+                # Save the code for future reference
+                container.exec_run(f"cp {temp_file} /tmp/code.py", timeout=5)
                 
                 # Execute the code file
                 exec_result = container.exec_run(
