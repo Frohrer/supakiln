@@ -410,7 +410,21 @@ async def create_scheduled_job(request: ScheduledJobRequest, db: Session = Depen
 async def list_scheduled_jobs(db: Session = Depends(get_db)):
     """List all scheduled jobs."""
     jobs = db.query(ScheduledJob).all()
-    return jobs
+    # Convert datetime fields to ISO format strings
+    return [
+        {
+            "id": job.id,
+            "name": job.name,
+            "code": job.code,
+            "cron_expression": job.cron_expression,
+            "packages": job.packages,
+            "container_id": job.container_id,
+            "created_at": job.created_at.isoformat(),
+            "last_run": job.last_run.isoformat() if job.last_run else None,
+            "is_active": job.is_active
+        }
+        for job in jobs
+    ]
 
 @app.get("/jobs/{job_id}", response_model=ScheduledJobResponse)
 async def get_scheduled_job(job_id: int, db: Session = Depends(get_db)):
