@@ -219,7 +219,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                     error_msg = f"Failed to write code to file: {write_result.output.decode()}"
                     # Log the error
                     log = ExecutionLog(
-                        code=request.code,
+                        code=request.code,  # Always include the code
                         error=error_msg,
                         container_id=request.container_id,
                         execution_time=time.time() - start_time,
@@ -250,7 +250,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                 
                 # Log the execution
                 log = ExecutionLog(
-                    code=request.code,
+                    code=request.code,  # Always include the code
                     output=output if success else None,
                     error=error,
                     container_id=request.container_id,
@@ -284,7 +284,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                 error_msg = str(e)
                 # Log the error
                 log = ExecutionLog(
-                    code=request.code,
+                    code=request.code,  # Always include the code
                     error=error_msg,
                     container_id=request.container_id,
                     execution_time=time.time() - start_time,
@@ -327,7 +327,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             
             # Log the execution
             log = ExecutionLog(
-                code=request.code,
+                code=request.code,  # Always include the code
                 output=result.get('output'),
                 error=result.get('error'),
                 container_id=result.get('container_id'),
@@ -338,23 +338,14 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             db.commit()
             
             return result
-    except docker.errors.ImageNotFound:
-        error_msg = "Failed to build container image. Please ensure Docker is running and you have the necessary permissions."
-        # Log the error
-        log = ExecutionLog(
-            code=request.code,
-            error=error_msg,
-            execution_time=time.time() - start_time,
-            status='error'
-        )
-        db.add(log)
-        db.commit()
-        raise HTTPException(status_code=500, detail=error_msg)
+    except HTTPException as e:
+        # Don't log HTTP exceptions as they're expected errors
+        raise e
     except Exception as e:
         error_msg = str(e)
         # Log the error
         log = ExecutionLog(
-            code=request.code,
+            code=request.code if request.code else "Error occurred before code execution",  # Provide a default message
             error=error_msg,
             execution_time=time.time() - start_time,
             status='error'
