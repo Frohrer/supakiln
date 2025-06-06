@@ -4,6 +4,7 @@ import json
 import time
 import hashlib
 import threading
+import base64
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
@@ -167,30 +168,16 @@ USER codeuser
         
         container_id = self.containers[package_hash]
         
-        # Create a temporary file with the code
-        temp_file = f"/tmp/code_{int(time.time())}.py"
-        escaped_code = code.replace("'", "'\\''")
-        write_command = f"echo '{escaped_code}' > {temp_file}"
-        success, _, error = self._execute_with_timeout(container_id, write_command, timeout)
-        if not success:
-            return {
-                "success": False,
-                "output": None,
-                "error": f"Failed to write code to file: {error}"
-            }
-        
-        # Execute the code file
-        exec_command = f"python3 {temp_file}"
+        # Encode the code in base64 and execute directly
+        encoded_code = base64.b64encode(code.encode()).decode()
+        exec_command = f"echo '{encoded_code}' | base64 -d | python3"
         success, output, error = self._execute_with_timeout(container_id, exec_command, timeout)
-        
-        # Clean up the temporary file
-        cleanup_command = f"rm {temp_file}"
-        self._execute_with_timeout(container_id, cleanup_command, timeout)
         
         return {
             "success": success,
             "output": output,
-            "error": error
+            "error": error,
+            "container_id": container_id
         }
     
     def cleanup(self):
