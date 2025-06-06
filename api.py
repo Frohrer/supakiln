@@ -383,7 +383,6 @@ async def create_scheduled_job(request: ScheduledJobRequest, db: Session = Depen
         
         # Schedule job
         scheduler.add_job(
-            job_id=str(db_job.id),
             name=request.name,
             code=request.code,
             cron_expression=request.cron_expression,
