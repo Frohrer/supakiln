@@ -13,6 +13,7 @@ from scheduler import scheduler
 from sqlalchemy.orm import Session
 import time
 from datetime import datetime
+import base64
 
 app = FastAPI(title="Code Execution Engine API")
 
@@ -247,8 +248,25 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             
             # Create a temporary file with the code
             temp_file = f"/tmp/code_{int(time.time())}.py"
-            escaped_code = request.code.replace("'", "'\\''")
-            write_command = f"echo '{escaped_code}' > {temp_file}"
+            
+            # Encode the code in base64
+            encoded_code = base64.b64encode(request.code.encode()).decode()
+            
+            # Create a Python script that will decode and execute the code
+            wrapper_script = f"""
+import base64
+import sys
+
+# Decode the base64 encoded code
+encoded_code = '{encoded_code}'
+code = base64.b64decode(encoded_code).decode()
+
+# Execute the decoded code
+exec(code)
+"""
+            
+            # Write the wrapper script to the container
+            write_command = f"echo '{wrapper_script}' > {temp_file}"
             try:
                 write_result = container.exec_run(write_command, timeout=request.timeout)
                 if write_result.exit_code != 0:
@@ -274,7 +292,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                 # Save the code for future reference
                 container.exec_run(f"cp {temp_file} /tmp/code.py", timeout=5)
                 
-                # Execute the code file
+                # Execute the wrapper script
                 exec_result = container.exec_run(
                     f"python3 {temp_file}",
                     timeout=request.timeout
