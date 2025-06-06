@@ -13,7 +13,6 @@ from scheduler import scheduler
 from sqlalchemy.orm import Session
 import time
 from datetime import datetime
-import base64
 
 app = FastAPI(title="Code Execution Engine API")
 
@@ -248,9 +247,8 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             
             # Create a temporary file with the code
             temp_file = f"/tmp/code_{int(time.time())}.py"
-            # Encode the code in base64 to avoid escaping issues
-            encoded_code = base64.b64encode(request.code.encode()).decode()
-            write_command = f"echo '{encoded_code}' | base64 -d > {temp_file}"
+            escaped_code = request.code.replace("'", "'\\''")
+            write_command = f"echo '{escaped_code}' > {temp_file}"
             try:
                 write_result = container.exec_run(write_command, timeout=request.timeout)
                 if write_result.exit_code != 0:

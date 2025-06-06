@@ -6,7 +6,6 @@ import hashlib
 import threading
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-import base64
 
 class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
@@ -78,47 +77,14 @@ class CodeExecutor:
         dockerfile_content = f"""
 FROM {self.image_name}:base
 
-# Create non-root user
-RUN useradd -m -u 1000 codeuser
+# Switch to root for package installation
+USER root
 
-# Set up Python environment
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PATH="/home/codeuser/.local/bin:${PATH}"
+# Install packages
+RUN pip install {' '.join(packages)}
 
-# Create and set up app directory
-WORKDIR /app
-RUN mkdir -p /app/code && \
-    chown -R codeuser:codeuser /app
-
-# Switch to non-root user
+# Switch back to non-root user
 USER codeuser
-
-# Install packages as non-root user
-RUN pip install --no-cache-dir --user {' '.join(packages)}
-
-# Set up secure environment
-ENV PYTHONPATH=/app
-
-# Create a restricted environment
-RUN mkdir -p /app/code && \
-    chmod 755 /app/code && \
-    chown -R codeuser:codeuser /app/code
-
-# Set up secure Python environment
-ENV PYTHONPATH=/app/code
-ENV PYTHONHOME=/usr/local
-ENV PYTHONSTARTUP=/app/code/.pythonrc
-
-# Create a restricted .pythonrc
-RUN echo "import sys; sys.path = ['/app/code']" > /app/code/.pythonrc && \
-    chown codeuser:codeuser /app/code/.pythonrc && \
-    chmod 644 /app/code/.pythonrc
-
-# Set up secure environment variables
-ENV HOME=/home/codeuser
-ENV PATH=/home/codeuser/.local/bin:/usr/local/bin:/usr/bin:/bin
-ENV PYTHONIOENCODING=utf-8
 """
         
         with open("Dockerfile.temp", "w") as f:
@@ -144,14 +110,6 @@ ENV PYTHONIOENCODING=utf-8
     def _execute_with_timeout(self, container_id: str, command: str, timeout: int) -> Tuple[bool, str, Optional[str]]:
         """Execute a command in a container with timeout."""
         try:
-            # Check if container exists and is running
-            success, output, error = self._run_docker_command(["docker", "inspect", "-f", "{{.State.Running}}", container_id])
-            if not success or output.strip() != "true":
-                # Container is not running, try to start it
-                success, output, error = self._run_docker_command(["docker", "start", container_id])
-                if not success:
-                    return False, None, f"Container {container_id} is not running and could not be started: {error}"
-
             result = subprocess.run(
                 ["docker", "exec", container_id, "sh", "-c", command],
                 capture_output=True,
@@ -190,76 +148,39 @@ ENV PYTHONIOENCODING=utf-8
         # Get or create container
         if package_hash not in self.containers:
             image_tag = self._build_image(packages)
-            print(f"Creating container with image {image_tag}")
             success, output, error = self._run_docker_command([
                 "docker", "run",
                 "-d",
                 "--memory", "512m",
                 "--cpus", "0.5",
-                # Temporarily remove some restrictions for debugging
-                # "--network", "none",  # Disable network access
-                # "--cap-drop", "ALL",  # Drop all capabilities
-                # "--security-opt", "no-new-privileges",  # Prevent privilege escalation
-                # "--security-opt", "seccomp=unconfined",  # Use default seccomp profile
-                "--pids-limit", "50",  # Limit number of processes
-                "--ulimit", "nofile=64:64",  # Limit file descriptors
-                "--ulimit", "nproc=50:50",  # Limit number of processes
-                # "--read-only",  # Make container filesystem read-only
-                "--tmpfs", "/tmp:rw,noexec,nosuid,size=50m",  # Mount tmpfs for temporary files
                 image_tag,
                 "tail", "-f", "/dev/null"
             ])
             if not success:
-                print(f"Failed to create container: {error}")
                 return {
                     "success": False,
                     "output": None,
                     "error": f"Failed to create container: {error}"
                 }
             container_id = output.strip()
-            print(f"Created container {container_id}")
-            
-            # Verify container is running
-            success, output, error = self._run_docker_command(["docker", "inspect", "-f", "{{.State.Running}}", container_id])
-            if not success or output.strip() != "true":
-                print(f"Container {container_id} failed to start. State: {output.strip()}")
-                # Get container logs
-                success, logs, _ = self._run_docker_command(["docker", "logs", container_id])
-                if success:
-                    print(f"Container logs: {logs}")
-                return {
-                    "success": False,
-                    "output": None,
-                    "error": f"Container failed to start: {error}"
-                }
-            
             self.containers[package_hash] = container_id
         
         container_id = self.containers[package_hash]
         
-        # Create a temporary file with the code using base64 encoding
+        # Create a temporary file with the code
         temp_file = f"/tmp/code_{int(time.time())}.py"
-        encoded_code = base64.b64encode(code.encode()).decode()
-        write_command = f"echo '{encoded_code}' | base64 -d > {temp_file}"
+        escaped_code = code.replace("'", "'\\''")
+        write_command = f"echo '{escaped_code}' > {temp_file}"
         success, _, error = self._execute_with_timeout(container_id, write_command, timeout)
         if not success:
-            # If container is not running, try to recreate it
-            if "is not running" in str(error):
-                # Remove the old container
-                self._run_docker_command(["docker", "rm", "-f", container_id])
-                # Remove from tracking
-                if package_hash in self.containers:
-                    del self.containers[package_hash]
-                # Retry execution which will create a new container
-                return self.execute_code(code, packages, timeout)
             return {
                 "success": False,
                 "output": None,
                 "error": f"Failed to write code to file: {error}"
             }
         
-        # Execute the code file with restricted Python environment
-        exec_command = f"PYTHONPATH=/app/code python3 {temp_file}"
+        # Execute the code file
+        exec_command = f"python3 {temp_file}"
         success, output, error = self._execute_with_timeout(container_id, exec_command, timeout)
         
         # Clean up the temporary file
