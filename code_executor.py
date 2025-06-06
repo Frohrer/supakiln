@@ -6,6 +6,7 @@ import hashlib
 import threading
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import base64
 
 class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
@@ -209,10 +210,10 @@ ENV PYTHONIOENCODING=utf-8
         
         container_id = self.containers[package_hash]
         
-        # Create a temporary file with the code
+        # Create a temporary file with the code using base64 encoding
         temp_file = f"/tmp/code_{int(time.time())}.py"
-        escaped_code = code.replace("'", "'\\''")
-        write_command = f"echo '{escaped_code}' > {temp_file}"
+        encoded_code = base64.b64encode(code.encode()).decode()
+        write_command = f"echo '{encoded_code}' | base64 -d > {temp_file}"
         success, _, error = self._execute_with_timeout(container_id, write_command, timeout)
         if not success:
             return {
