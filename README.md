@@ -11,6 +11,8 @@ A secure and efficient Python code execution engine that runs code in isolated D
 - **REST API**: Programmatic access to code execution and container management
 - **Resource Limits**: CPU and memory limits for each container
 - **Timeout Handling**: Configurable execution timeouts
+- **Job Scheduling**: Schedule code execution using cron expressions
+- **Execution Logs**: Track and view execution history and results
 
 ## Project Structure
 
@@ -49,6 +51,22 @@ A secure and efficient Python code execution engine that runs code in isolated D
   - Response: `Array<{ container_id: string, name: string, packages: string[] }>`
 - `DELETE /containers/{container_id}`: Delete a specific container
 - `DELETE /containers`: Clean up all containers
+
+### Job Scheduling
+- `POST /jobs`: Create a new scheduled job
+  - Request body: `{ name: string, cron: string, code: string }`
+  - Response: `{ job_id: string }`
+- `GET /jobs`: List all scheduled jobs
+  - Response: `Array<{ job_id: string, name: string, cron: string, code: string }>`
+- `PUT /jobs/{job_id}`: Update a scheduled job
+  - Request body: `{ name?: string, cron?: string, code?: string }`
+  - Response: `{ success: boolean }`
+- `DELETE /jobs/{job_id}`: Delete a scheduled job
+
+### Viewing Logs
+- `GET /logs`: Get execution logs
+  - Query parameters: `{ job_id?: string }`
+  - Response: `Array<{ log_id: string, job_id: string, timestamp: string, output: string, error: string }>`
 
 ## Web Interface
 
