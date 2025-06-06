@@ -61,7 +61,7 @@ const Scheduler: React.FC = () => {
   const handleRunNow = async (job: ScheduledJob) => {
     try {
       await api.post('/execute', {
-        code: job.code,
+        job_id: job.id,
         packages: job.packages ? job.packages.split(',') : [],
         container_id: job.container_id,
       });
