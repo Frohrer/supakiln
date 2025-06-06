@@ -53,8 +53,7 @@ class JobScheduler:
             try:
                 result = self.executor.execute_code(
                     code=job.code,
-                    packages=job.packages.split(',') if job.packages else [],
-                    container_id=job.container_id
+                    packages=job.packages.split(',') if job.packages else []
                 )
                 
                 execution_time = time.time() - start_time
@@ -65,7 +64,7 @@ class JobScheduler:
                     code=job.code,
                     output=result.get('output'),
                     error=result.get('error'),
-                    container_id=job.container_id,
+                    container_id=result.get('container_id'),
                     execution_time=execution_time,
                     status='success' if result.get('success') else 'error'
                 )
@@ -80,7 +79,7 @@ class JobScheduler:
                     job_id=job.id,
                     code=job.code,
                     error=str(e),
-                    container_id=job.container_id,
+                    container_id=None,
                     execution_time=execution_time,
                     status='error'
                 )
