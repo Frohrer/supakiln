@@ -5,6 +5,7 @@ import Layout from './components/Layout';
 import Editor from './pages/Editor';
 import Scheduler from './pages/Scheduler';
 import Logs from './pages/Logs';
+import Containers from './pages/Containers';
 
 const theme = createTheme({
   palette: {
@@ -26,6 +27,7 @@ function App() {
         <Layout>
           <Routes>
             <Route path="/" element={<Editor />} />
+            <Route path="/containers" element={<Containers />} />
             <Route path="/scheduler" element={<Scheduler />} />
             <Route path="/logs" element={<Logs />} />
           </Routes>

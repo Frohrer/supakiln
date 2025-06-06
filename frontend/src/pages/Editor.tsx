@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Box, Grid, Paper, Typography, Button, TextField, IconButton, Switch, FormControlLabel } from '@mui/material';
+import { Box, Grid, Paper, Typography, Button, TextField, IconButton, Switch, FormControlLabel, MenuItem } from '@mui/material';
 import { Add as AddIcon, Delete as DeleteIcon } from '@mui/icons-material';
 import Editor from '@monaco-editor/react';
 import api from '../config/api';
-import ContainerList from '../components/ContainerList';
 
 interface Container {
   id: string;
@@ -46,17 +45,6 @@ const CodeEditor: React.FC = () => {
     const newPackages = [...packages];
     newPackages[index] = value;
     setPackages(newPackages);
-  };
-
-  const handleEditContainer = async (container: Container) => {
-    try {
-      const response = await api.get(`/containers/${container.id}`);
-      setCode(response.data.code || '');
-      setPackages(response.data.packages || ['']);
-      setSelectedContainer(container.id);
-    } catch (error) {
-      setOutput('Error loading container: ' + (error as Error).message);
-    }
   };
 
   const handleRunCode = async () => {
@@ -103,9 +91,26 @@ const CodeEditor: React.FC = () => {
         </Paper>
       </Grid>
       <Grid item xs={12} md={4}>
-        <ContainerList onEditContainer={handleEditContainer} />
-        <Paper sx={{ p: 2, mb: 2, mt: 2 }}>
+        <Paper sx={{ p: 2, mb: 2 }}>
           <Typography variant="h6" gutterBottom>
+            Container & Packages
+          </Typography>
+          <TextField
+            select
+            fullWidth
+            label="Select Container"
+            value={selectedContainer}
+            onChange={(e) => setSelectedContainer(e.target.value)}
+            sx={{ mb: 2 }}
+          >
+            <MenuItem value="">New Container</MenuItem>
+            {containers.map((container) => (
+              <MenuItem key={container.id} value={container.id}>
+                {container.name}
+              </MenuItem>
+            ))}
+          </TextField>
+          <Typography variant="subtitle1" gutterBottom>
             Packages
           </Typography>
           {packages.map((package_, index) => (
