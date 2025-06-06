@@ -77,14 +77,47 @@ class CodeExecutor:
         dockerfile_content = f"""
 FROM {self.image_name}:base
 
-# Switch to root for package installation
-USER root
+# Create non-root user
+RUN useradd -m -u 1000 codeuser
 
-# Install packages
-RUN pip install {' '.join(packages)}
+# Set up Python environment
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PATH="/home/codeuser/.local/bin:${PATH}"
 
-# Switch back to non-root user
+# Create and set up app directory
+WORKDIR /app
+RUN mkdir -p /app/code && \
+    chown -R codeuser:codeuser /app
+
+# Switch to non-root user
 USER codeuser
+
+# Install packages as non-root user
+RUN pip install --no-cache-dir --user {' '.join(packages)}
+
+# Set up secure environment
+ENV PYTHONPATH=/app
+
+# Create a restricted environment
+RUN mkdir -p /app/code && \
+    chmod 755 /app/code && \
+    chown -R codeuser:codeuser /app/code
+
+# Set up secure Python environment
+ENV PYTHONPATH=/app/code
+ENV PYTHONHOME=/usr/local
+ENV PYTHONSTARTUP=/app/code/.pythonrc
+
+# Create a restricted .pythonrc
+RUN echo "import sys; sys.path = ['/app/code']" > /app/code/.pythonrc && \
+    chown codeuser:codeuser /app/code/.pythonrc && \
+    chmod 644 /app/code/.pythonrc
+
+# Set up secure environment variables
+ENV HOME=/home/codeuser
+ENV PATH=/home/codeuser/.local/bin:/usr/local/bin:/usr/bin:/bin
+ENV PYTHONIOENCODING=utf-8
 """
         
         with open("Dockerfile.temp", "w") as f:
@@ -153,6 +186,15 @@ USER codeuser
                 "-d",
                 "--memory", "512m",
                 "--cpus", "0.5",
+                "--network", "none",  # Disable network access
+                "--cap-drop", "ALL",  # Drop all capabilities
+                "--security-opt", "no-new-privileges",  # Prevent privilege escalation
+                "--security-opt", "seccomp=unconfined",  # Use default seccomp profile
+                "--pids-limit", "50",  # Limit number of processes
+                "--ulimit", "nofile=64:64",  # Limit file descriptors
+                "--ulimit", "nproc=50:50",  # Limit number of processes
+                "--read-only",  # Make container filesystem read-only
+                "--tmpfs", "/tmp:rw,noexec,nosuid,size=50m",  # Mount tmpfs for temporary files
                 image_tag,
                 "tail", "-f", "/dev/null"
             ])
@@ -179,8 +221,8 @@ USER codeuser
                 "error": f"Failed to write code to file: {error}"
             }
         
-        # Execute the code file
-        exec_command = f"python3 {temp_file}"
+        # Execute the code file with restricted Python environment
+        exec_command = f"PYTHONPATH=/app/code python3 {temp_file}"
         success, output, error = self._execute_with_timeout(container_id, exec_command, timeout)
         
         # Clean up the temporary file
