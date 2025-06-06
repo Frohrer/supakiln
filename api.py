@@ -38,7 +38,8 @@ except docker.errors.DockerException as e:
     raise
 
 class CodeExecutionRequest(BaseModel):
-    code: str
+    code: Optional[str] = None
+    job_id: Optional[int] = None
     packages: Optional[List[str]] = None
     timeout: Optional[int] = 30
     container_id: Optional[str] = None
@@ -189,6 +190,17 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
     """
     start_time = time.time()
     try:
+        # If code is not provided in request but we have a job_id, get code from the job
+        if not request.code and hasattr(request, 'job_id'):
+            job = db.query(ScheduledJob).filter(ScheduledJob.id == request.job_id).first()
+            if job:
+                request.code = job.code
+            else:
+                raise HTTPException(status_code=404, detail="Job not found")
+        
+        if not request.code:
+            raise HTTPException(status_code=400, detail="Code is required")
+
         if request.container_id:
             # Verify container exists
             if request.container_id not in executor.containers.values():
@@ -381,14 +393,8 @@ async def create_scheduled_job(request: ScheduledJobRequest, db: Session = Depen
         db.commit()
         db.refresh(db_job)
         
-        # Schedule job
-        scheduler.add_job(
-            name=request.name,
-            code=request.code,
-            cron_expression=request.cron_expression,
-            packages=request.packages,
-            container_id=request.container_id
-        )
+        # The scheduler will pick up the new job through load_existing_jobs
+        scheduler.load_existing_jobs()
         
         # Convert datetime fields to ISO format strings for response
         return {
