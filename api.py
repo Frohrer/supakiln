@@ -25,14 +25,14 @@ allowed_origins = [
     if origin.strip()  # Only include non-empty origins
 ]
 
-# Add CORS middleware with permissive settings for development
+# Add CORS middleware as the first middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,  # Use specific origins from env vars
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
-    expose_headers=["*"],  # Expose all headers
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["*"],
     max_age=86400,  # Cache preflight requests for 24 hours
 )
 
