@@ -25,6 +25,7 @@ export const api = axios.create({
     'CF-Access-Client-Secret': CF_ACCESS_CLIENT_SECRET,
   },
   withCredentials: true,  // Enable sending cookies and auth headers
+  credentials: 'include',  // Explicitly set credentials to include
 });
 
 // Add request interceptor to ensure headers are set for all requests
@@ -32,10 +33,15 @@ api.interceptors.request.use((config: AxiosRequestConfig) => {
   // Ensure withCredentials is set for all requests
   config.withCredentials = true;
   
-  // Ensure Cloudflare Access headers are set
+  // Ensure Cloudflare Access headers are set for all requests including OPTIONS
   if (config.headers) {
+    // These headers must be set for both the actual request and preflight
     config.headers['CF-Access-Client-Id'] = CF_ACCESS_CLIENT_ID;
     config.headers['CF-Access-Client-Secret'] = CF_ACCESS_CLIENT_SECRET;
+    
+    // Explicitly allow these headers in preflight
+    config.headers['Access-Control-Allow-Headers'] = 'CF-Access-Client-Id, CF-Access-Client-Secret, Content-Type';
+    config.headers['Access-Control-Allow-Credentials'] = 'true';
   }
   
   return config;
