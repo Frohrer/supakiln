@@ -21,6 +21,12 @@ services:
     environment:
       - DOCKER_TLS_CERTDIR=""  # Disable TLS for simplicity
     command: ["dockerd", "--host=tcp://0.0.0.0:2376", "--host=unix:///var/run/docker.sock"]
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   backend:
     build:
@@ -36,4 +42,5 @@ services:
       - BACKEND_WS_URL=${BACKEND_WS_URL}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
     depends_on:
-      - docker-daemon 
+      docker-daemon:
+        condition: service_healthy 

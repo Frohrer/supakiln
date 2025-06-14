@@ -17,6 +17,12 @@ services:
     environment:
       - DOCKER_TLS_CERTDIR=""  # Disable TLS for simplicity
     command: ["dockerd", "--host=tcp://0.0.0.0:2376", "--host=unix:///var/run/docker.sock"]
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   backend:
     build:
@@ -30,5 +36,6 @@ services:
       - DOCKER_HOST=tcp://docker-daemon:2376
       - NODE_ENV=development
     depends_on:
-      - docker-daemon
+      docker-daemon:
+        condition: service_healthy
     command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload 

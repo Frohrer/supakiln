@@ -35,38 +35,14 @@ class CodeExecutor:
         except Exception as e:
             return False, None, str(e)
         
-    def _wait_for_docker_daemon(self, max_retries: int = 30, delay: int = 2):
-        """Wait for Docker daemon to be ready with retry logic."""
-        docker_host = os.environ.get('DOCKER_HOST', 'default')
-        print(f"Waiting for Docker daemon at: {docker_host}")
-        
-        last_error = None
-        for attempt in range(max_retries):
-            try:
-                success, output, error = self._run_docker_command(["docker", "info"], timeout=5)
-                if success:
-                    print("Docker daemon is ready")
-                    return True
-                print(f"Docker daemon not ready (attempt {attempt + 1}/{max_retries})")
-                if error:
-                    print(f"Error: {error}")
-                    last_error = error
-                time.sleep(delay)
-            except Exception as e:
-                print(f"Docker daemon check failed (attempt {attempt + 1}/{max_retries}): {e}")
-                last_error = str(e)
-                time.sleep(delay)
-        
-        raise Exception(f"Docker daemon failed to become ready after {max_retries} attempts. Last error: {last_error}")
-    
     def _ensure_base_image(self):
         """Ensure the base image exists, build it if it doesn't."""
         if self._base_image_ready:
             return
             
         try:
-            # Wait for Docker daemon to be ready first
-            self._wait_for_docker_daemon()
+            docker_host = os.environ.get('DOCKER_HOST', 'default')
+            print(f"Using Docker daemon at: {docker_host}")
             
             # Check if image exists
             success, _, error = self._run_docker_command(["docker", "image", "inspect", f"{self.image_name}:base"])
