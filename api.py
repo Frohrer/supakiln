@@ -39,9 +39,52 @@ app.add_middleware(
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-# Initialize executor with error handling
+# Initialize executor
+executor = CodeExecutor()
+
+# Initialize Docker client separately with proper error handling
+def get_docker_client():
+    """Get Docker client with proper error handling for DinD."""
+    try:
+        # First, check if DOCKER_HOST has problematic values
+        docker_host = os.environ.get('DOCKER_HOST')
+        if docker_host and 'http+docker' in docker_host:
+            # Remove problematic DOCKER_HOST
+            print(f"Removing problematic DOCKER_HOST: {docker_host}")
+            del os.environ['DOCKER_HOST']
+        
+        # For Docker-in-Docker, try the mounted socket path first
+        socket_paths = [
+            'unix:///var/run/docker.sock',  # Standard DinD mount
+            'unix://var/run/docker.sock',   # Alternative format
+        ]
+        
+        for socket_path in socket_paths:
+            try:
+                client = docker.DockerClient(base_url=socket_path)
+                # Test the connection
+                client.ping()
+                return client
+            except Exception:
+                continue
+            
+        # Fallback to from_env() with cleaned environment
+        client = docker.from_env()
+        client.ping()
+        return client
+        
+    except Exception as e:
+        raise docker.errors.DockerException(
+            f"Could not connect to Docker daemon. "
+            f"For Docker-in-Docker: ensure /var/run/docker.sock is mounted and accessible. "
+            f"For native Linux: ensure Docker daemon is running (sudo systemctl start docker). "
+            f"Original error: {e}"
+        )
+
+# Initialize Docker client once
 try:
-    executor = CodeExecutor()
+    docker_client = get_docker_client()
+    print("Docker client initialized successfully")
 except docker.errors.DockerException as e:
     print(f"Error initializing Docker: {str(e)}")
     print("Please ensure Docker is running and you have the necessary permissions.")
@@ -152,7 +195,7 @@ async def create_container(request: PackageInstallRequest):
         
         # Create container if it doesn't exist
         if package_hash not in executor.containers:
-            container = executor.client.containers.run(
+            container = docker_client.containers.run(
                 image_tag,
                 detach=True,
                 tty=True,
@@ -187,7 +230,7 @@ async def list_containers():
     containers = []
     for package_hash, container_id in executor.containers.items():
         try:
-            container = executor.client.containers.get(container_id)
+            container = docker_client.containers.get(container_id)
             # Extract packages from image tag
             image_tag = container.image.tags[0]
             packages = image_tag.split(":")[-1].split(",")
@@ -210,7 +253,7 @@ async def get_container(container_id: str):
         if container_id not in executor.containers.values():
             raise HTTPException(status_code=404, detail="Container not found")
         
-        container = executor.client.containers.get(container_id)
+        container = docker_client.containers.get(container_id)
         image_tag = container.image.tags[0]
         packages = image_tag.split(":")[-1].split(",")
         
@@ -240,7 +283,7 @@ async def delete_container(container_id: str):
     """
     try:
         if container_id in executor.containers.values():
-            container = executor.client.containers.get(container_id)
+            container = docker_client.containers.get(container_id)
             container.stop()
             container.remove()
             # Remove from our tracking
@@ -281,7 +324,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                 raise HTTPException(status_code=404, detail="Container not found")
             
             # Execute in existing container
-            container = executor.client.containers.get(request.container_id)
+            container = docker_client.containers.get(request.container_id)
             
             # Get environment variables
             env_manager = get_env_manager()
@@ -331,7 +374,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             
             # Create container if it doesn't exist
             if package_hash not in executor.containers:
-                container = executor.client.containers.run(
+                container = docker_client.containers.run(
                     image_tag,
                     detach=True,
                     tty=True,
@@ -348,7 +391,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             env_vars = env_manager.get_all_variables()
             
             # Execute with environment variables
-            container = executor.client.containers.get(container_id)
+            container = docker_client.containers.get(container_id)
             encoded_code = base64.b64encode(request.code.encode()).decode()
             
             result = container.exec_run(

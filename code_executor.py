@@ -13,55 +13,7 @@ class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
         self.image_name = image_name
         self.containers: Dict[str, str] = {}  # package_hash -> container_id
-        self.client = self._initialize_docker_client()  # Initialize Docker client
         self._ensure_base_image()
-        
-    def _initialize_docker_client(self):
-        """Initialize Docker client with proper error handling for DinD and Linux."""
-        try:
-            # First, check if DOCKER_HOST has problematic values
-            docker_host = os.environ.get('DOCKER_HOST')
-            if docker_host and 'http+docker' in docker_host:
-                # Remove problematic DOCKER_HOST
-                print(f"Removing problematic DOCKER_HOST: {docker_host}")
-                del os.environ['DOCKER_HOST']
-            
-            # For Docker-in-Docker, try the mounted socket path first
-            socket_paths = [
-                'unix:///var/run/docker.sock',  # Standard DinD mount
-                'unix://var/run/docker.sock',   # Alternative format
-            ]
-            
-            for socket_path in socket_paths:
-                try:
-                    print(f"Trying Docker connection: {socket_path}")
-                    client = docker.DockerClient(base_url=socket_path)
-                    # Test the connection
-                    client.ping()
-                    print(f"Successfully connected to Docker via {socket_path}")
-                    return client
-                except Exception as e:
-                    print(f"Failed to connect via {socket_path}: {e}")
-                    continue
-                
-            # Fallback to from_env() with cleaned environment
-            try:
-                print("Trying Docker connection via from_env()")
-                client = docker.from_env()
-                client.ping()
-                print("Successfully connected to Docker via from_env()")
-                return client
-            except Exception as e:
-                print(f"Failed to connect via from_env(): {e}")
-                raise
-                
-        except Exception as e:
-            raise docker.errors.DockerException(
-                f"Could not connect to Docker daemon. "
-                f"For Docker-in-Docker: ensure /var/run/docker.sock is mounted and accessible. "
-                f"For native Linux: ensure Docker daemon is running (sudo systemctl start docker). "
-                f"Original error: {e}"
-            )
         
     def _run_docker_command(self, command: List[str], timeout: int = 30) -> Tuple[bool, str, Optional[str]]:
         """Run a Docker command and return (success, output, error)."""
