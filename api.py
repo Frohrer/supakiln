@@ -18,11 +18,14 @@ from env_manager import EnvironmentManager, EnvironmentVariable
 
 app = FastAPI(title="Code Execution Engine API")
 
+# Get frontend URL from environment
+frontend_url = os.getenv('VITE_FRONTEND_URL', 'http://localhost:3000')
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[frontend_url],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     max_age=86400,  # Cache preflight requests for 24 hours
