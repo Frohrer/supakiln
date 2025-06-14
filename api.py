@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -25,13 +25,42 @@ allowed_origins = [
     if origin.strip()  # Only include non-empty origins
 ]
 
+# Custom OPTIONS handler for preflight requests
+@app.options("/{path:path}")
+async def handle_options(request: Request):
+    """Handle preflight OPTIONS requests without authentication."""
+    origin = request.headers.get("origin")
+    
+    # Check if origin is allowed
+    if origin and (origin in allowed_origins or "*" in allowed_origins):
+        headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "Content-Type, CF-Access-Client-Id, CF-Access-Client-Secret, Authorization, X-Requested-With, Accept, Origin",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "86400"
+        }
+        return Response(status_code=200, headers=headers)
+    
+    return Response(status_code=403)
+
 # Add CORS middleware as the first middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,  # Must be specific origins when using credentials
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Content-Type",
+        "CF-Access-Client-Id",
+        "CF-Access-Client-Secret",
+        "Authorization",
+        "X-Requested-With",
+        "Accept",
+        "Origin",
+        "Access-Control-Request-Method",
+        "Access-Control-Request-Headers"
+    ],
     expose_headers=["*"],
     max_age=86400,  # Cache preflight requests for 24 hours
 )

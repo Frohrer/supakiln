@@ -5,6 +5,7 @@ import time
 import hashlib
 import threading
 import base64
+import docker
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
@@ -12,6 +13,7 @@ class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
         self.image_name = image_name
         self.containers: Dict[str, str] = {}  # package_hash -> container_id
+        self.client = docker.from_env()  # Initialize Docker client
         self._ensure_base_image()
         
     def _run_docker_command(self, command: List[str], timeout: int = 30) -> Tuple[bool, str, Optional[str]]:
