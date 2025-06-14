@@ -6,6 +6,7 @@ import Editor from './pages/Editor';
 import Scheduler from './pages/Scheduler';
 import Logs from './pages/Logs';
 import Containers from './pages/Containers';
+import EnvironmentVariables from './pages/EnvironmentVariables';
 
 const theme = createTheme({
   palette: {
@@ -30,6 +31,7 @@ function App() {
             <Route path="/containers" element={<Containers />} />
             <Route path="/scheduler" element={<Scheduler />} />
             <Route path="/logs" element={<Logs />} />
+            <Route path="/env" element={<EnvironmentVariables />} />
           </Routes>
         </Layout>
       </Router>

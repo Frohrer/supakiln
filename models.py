@@ -6,6 +6,15 @@ import os
 
 Base = declarative_base()
 
+class EnvironmentVariable(Base):
+    __tablename__ = "environment_variables"
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+    value = Column(Text, nullable=False)  # Encrypted value
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 class ScheduledJob(Base):
     __tablename__ = "scheduled_jobs"
     

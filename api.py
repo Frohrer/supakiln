@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 import time
 from datetime import datetime
 import base64
+from env_manager import EnvironmentManager, EnvironmentVariable
 
 app = FastAPI(title="Code Execution Engine API")
 
@@ -24,6 +25,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    max_age=86400,  # Cache preflight requests for 24 hours
 )
 
 # Mount static files - update the path to be relative to the current file
@@ -84,8 +86,20 @@ class ExecutionLogResponse(BaseModel):
     started_at: str
     status: str
 
+class EnvVarRequest(BaseModel):
+    name: str
+    value: str
+
+class EnvVarResponse(BaseModel):
+    name: str
+    created_at: str
+    updated_at: str
+
 # Store container names
 container_names = {}  # container_id -> name
+
+# Initialize environment manager
+env_manager = None
 
 def get_db():
     db = SessionLocal()
@@ -93,6 +107,22 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def get_env_manager():
+    global env_manager
+    if env_manager is None:
+        db = SessionLocal()
+        try:
+            # Try to load existing key
+            if os.path.exists('.env_key'):
+                with open('.env_key', 'rb') as key_file:
+                    key = key_file.read()
+            else:
+                key = None
+            env_manager = EnvironmentManager(db, key)
+        finally:
+            db.close()
+    return env_manager
 
 @app.get("/")
 async def read_root():
@@ -246,129 +276,118 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             # Execute in existing container
             container = executor.client.containers.get(request.container_id)
             
+            # Get environment variables
+            env_manager = get_env_manager()
+            env_vars = env_manager.get_all_variables()
+            
             # Encode the code in base64
             encoded_code = base64.b64encode(request.code.encode()).decode()
             
-            try:
-                # Execute the code directly by piping base64 decoded content to python
-                exec_result = container.exec_run(
-                    f"echo '{encoded_code}' | base64 -d | python3",
-                    timeout=request.timeout
-                )
-                
-                # Save the original code for future reference
-                escaped_code = base64.b64encode(request.code.encode()).decode()
-                container.exec_run(f"echo '{escaped_code}' | base64 -d > /tmp/code.py", timeout=5)
-                
-                success = exec_result.exit_code == 0
-                output = exec_result.output.decode()
-                error = None if success else output
-                
-                # Log the execution
-                log = ExecutionLog(
-                    code=request.code,  # Always include the code
-                    output=output if success else None,
-                    error=error,
-                    container_id=request.container_id,
-                    execution_time=time.time() - start_time,
-                    status='success' if success else 'error'
-                )
-                db.add(log)
-                db.commit()
-                
-                return {
-                    "success": success,
-                    "output": output,
-                    "error": error,
-                    "container_id": request.container_id,
-                    "container_name": container_names.get(request.container_id, "Unnamed")
-                }
-            except Exception as e:
-                # Clean up container on error
-                try:
-                    container.stop()
-                    container.remove()
-                    # Remove from our tracking
-                    for package_hash, cid in list(executor.containers.items()):
-                        if cid == request.container_id:
-                            del executor.containers[package_hash]
-                    if request.container_id in container_names:
-                        del container_names[request.container_id]
-                except Exception:
-                    pass
-                
-                error_msg = str(e)
-                # Log the error
-                log = ExecutionLog(
-                    code=request.code,  # Always include the code
-                    error=error_msg,
-                    container_id=request.container_id,
-                    execution_time=time.time() - start_time,
-                    status='error'
-                )
-                db.add(log)
-                db.commit()
-                
-                return {
-                    "success": False,
-                    "output": None,
-                    "error": error_msg,
-                    "container_id": request.container_id,
-                    "container_name": container_names.get(request.container_id, "Unnamed")
-                }
-        else:
-            # Create new container and execute
-            result = executor.execute_code(
-                code=request.code,
-                packages=request.packages or [],
+            # Execute with environment variables
+            result = container.exec_run(
+                f"python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
+                environment=env_vars,
                 timeout=request.timeout
             )
             
-            # If execution failed or timed out, clean up the container
-            if not result.get("success"):
-                container_id = result.get("container_id")
-                if container_id:
-                    try:
-                        container = executor.client.containers.get(container_id)
-                        container.stop()
-                        container.remove()
-                        # Remove from our tracking
-                        for package_hash, cid in list(executor.containers.items()):
-                            if cid == container_id:
-                                del executor.containers[package_hash]
-                        if container_id in container_names:
-                            del container_names[container_id]
-                    except Exception:
-                        pass
+            output = result.output.decode() if result.exit_code == 0 else None
+            error = result.output.decode() if result.exit_code != 0 else None
             
             # Log the execution
             log = ExecutionLog(
-                code=request.code,  # Always include the code
-                output=result.get('output'),
-                error=result.get('error'),
-                container_id=result.get('container_id'),
+                job_id=request.job_id if hasattr(request, 'job_id') else None,
+                code=request.code,
+                output=output,
+                error=error,
+                container_id=request.container_id,
                 execution_time=time.time() - start_time,
-                status='success' if result.get('success') else 'error'
+                started_at=datetime.utcnow(),
+                status="success" if result.exit_code == 0 else "error"
             )
             db.add(log)
             db.commit()
             
-            return result
-    except HTTPException as e:
-        # Don't log HTTP exceptions as they're expected errors
-        raise e
+            return {
+                "success": result.exit_code == 0,
+                "output": output,
+                "error": error,
+                "container_id": request.container_id,
+                "container_name": container_names.get(request.container_id, "Unnamed")
+            }
+        else:
+            # Create a new container with packages
+            if not request.packages:
+                request.packages = []
+            
+            package_hash = executor._get_package_hash(request.packages)
+            image_tag = executor._build_image(request.packages)
+            
+            # Create container if it doesn't exist
+            if package_hash not in executor.containers:
+                container = executor.client.containers.run(
+                    image_tag,
+                    detach=True,
+                    tty=True,
+                    mem_limit="512m",
+                    cpu_period=100000,
+                    cpu_quota=50000
+                )
+                executor.containers[package_hash] = container.id
+            
+            container_id = executor.containers[package_hash]
+            
+            # Get environment variables
+            env_manager = get_env_manager()
+            env_vars = env_manager.get_all_variables()
+            
+            # Execute with environment variables
+            container = executor.client.containers.get(container_id)
+            encoded_code = base64.b64encode(request.code.encode()).decode()
+            
+            result = container.exec_run(
+                f"python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
+                environment=env_vars,
+                timeout=request.timeout
+            )
+            
+            output = result.output.decode() if result.exit_code == 0 else None
+            error = result.output.decode() if result.exit_code != 0 else None
+            
+            # Log the execution
+            log = ExecutionLog(
+                job_id=request.job_id if hasattr(request, 'job_id') else None,
+                code=request.code,
+                output=output,
+                error=error,
+                container_id=container_id,
+                execution_time=time.time() - start_time,
+                started_at=datetime.utcnow(),
+                status="success" if result.exit_code == 0 else "error"
+            )
+            db.add(log)
+            db.commit()
+            
+            return {
+                "success": result.exit_code == 0,
+                "output": output,
+                "error": error,
+                "container_id": container_id,
+                "container_name": container_names.get(container_id, "Unnamed")
+            }
     except Exception as e:
-        error_msg = str(e)
         # Log the error
         log = ExecutionLog(
-            code=request.code if request.code else "Error occurred before code execution",  # Provide a default message
-            error=error_msg,
+            job_id=request.job_id if hasattr(request, 'job_id') else None,
+            code=request.code,
+            error=str(e),
             execution_time=time.time() - start_time,
-            status='error'
+            started_at=datetime.utcnow(),
+            status="error"
         )
         db.add(log)
         db.commit()
-        raise HTTPException(status_code=500, detail=error_msg)
+        
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/containers")
 async def cleanup_all():
@@ -508,6 +527,41 @@ async def get_execution_log(log_id: int, db: Session = Depends(get_db)):
         **log.__dict__,
         'started_at': log.started_at.isoformat() if log.started_at else None
     }
+
+@app.post("/env", response_model=EnvVarResponse)
+async def set_environment_variable(request: EnvVarRequest, db: Session = Depends(get_db)):
+    """Set an environment variable."""
+    manager = get_env_manager()
+    manager.set_variable(request.name, request.value)
+    var = db.query(EnvironmentVariable).filter_by(name=request.name).first()
+    return EnvVarResponse(
+        name=var.name,
+        created_at=var.created_at.isoformat(),
+        updated_at=var.updated_at.isoformat()
+    )
+
+@app.get("/env", response_model=List[str])
+async def list_environment_variables():
+    """List all environment variable names."""
+    manager = get_env_manager()
+    return manager.list_variables()
+
+@app.get("/env/{name}")
+async def get_environment_variable(name: str):
+    """Get an environment variable value."""
+    manager = get_env_manager()
+    value = manager.get_variable(name)
+    if value is None:
+        raise HTTPException(status_code=404, detail="Environment variable not found")
+    return {"name": name, "value": value}
+
+@app.delete("/env/{name}")
+async def delete_environment_variable(name: str):
+    """Delete an environment variable."""
+    manager = get_env_manager()
+    if not manager.delete_variable(name):
+        raise HTTPException(status_code=404, detail="Environment variable not found")
+    return {"message": f"Environment variable {name} deleted successfully"}
 
 if __name__ == "__main__":
     # Create static directory if it doesn't exist
