@@ -21,17 +21,18 @@ app = FastAPI(title="Code Execution Engine API")
 # Get all allowed origins from environment variables
 allowed_origins = [
     origin.strip()
-    for origin in os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
+    for origin in os.getenv('ALLOWED_ORIGINS', '').split(',')
+    if origin.strip()  # Only include non-empty origins
 ]
 
-# Add CORS middleware with more permissive settings for Cloudflare Access
+# Add CORS middleware with permissive settings for development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins temporarily for debugging
+    allow_origins=allowed_origins,  # Use specific origins from env vars
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers
     max_age=86400,  # Cache preflight requests for 24 hours
 )
 
