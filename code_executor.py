@@ -13,16 +13,19 @@ class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
         self.image_name = image_name
         self.containers: Dict[str, str] = {}  # package_hash -> container_id
-        self._ensure_base_image()
+        self._base_image_ready = False
         
     def _run_docker_command(self, command: List[str], timeout: int = 30) -> Tuple[bool, str, Optional[str]]:
         """Run a Docker command and return (success, output, error)."""
         try:
+            # Make sure we pass the current environment including DOCKER_HOST
+            env = os.environ.copy()
             result = subprocess.run(
                 command,
                 capture_output=True,
                 text=True,
-                timeout=timeout
+                timeout=timeout,
+                env=env
             )
             if result.returncode == 0:
                 return True, result.stdout, None
@@ -32,9 +35,39 @@ class CodeExecutor:
         except Exception as e:
             return False, None, str(e)
         
+    def _wait_for_docker_daemon(self, max_retries: int = 30, delay: int = 2):
+        """Wait for Docker daemon to be ready with retry logic."""
+        docker_host = os.environ.get('DOCKER_HOST', 'default')
+        print(f"Waiting for Docker daemon at: {docker_host}")
+        
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                success, output, error = self._run_docker_command(["docker", "info"], timeout=5)
+                if success:
+                    print("Docker daemon is ready")
+                    return True
+                print(f"Docker daemon not ready (attempt {attempt + 1}/{max_retries})")
+                if error:
+                    print(f"Error: {error}")
+                    last_error = error
+                time.sleep(delay)
+            except Exception as e:
+                print(f"Docker daemon check failed (attempt {attempt + 1}/{max_retries}): {e}")
+                last_error = str(e)
+                time.sleep(delay)
+        
+        raise Exception(f"Docker daemon failed to become ready after {max_retries} attempts. Last error: {last_error}")
+    
     def _ensure_base_image(self):
         """Ensure the base image exists, build it if it doesn't."""
+        if self._base_image_ready:
+            return
+            
         try:
+            # Wait for Docker daemon to be ready first
+            self._wait_for_docker_daemon()
+            
             # Check if image exists
             success, _, error = self._run_docker_command(["docker", "image", "inspect", f"{self.image_name}:base"])
             if not success:
@@ -48,6 +81,8 @@ class CodeExecutor:
                 if not success:
                     raise Exception(f"Failed to build base image: {error}")
                 print("Base image built successfully")
+            
+            self._base_image_ready = True
         except Exception as e:
             print(f"Error ensuring base image: {e}")
             raise
@@ -61,6 +96,9 @@ class CodeExecutor:
     
     def _build_image(self, packages: List[str]) -> str:
         """Build a Docker image with the specified packages."""
+        # Ensure base image exists first
+        self._ensure_base_image()
+        
         package_hash = self._get_package_hash(packages)
         image_tag = f"{self.image_name}:{package_hash}"
         
@@ -112,19 +150,23 @@ USER codeuser
     def _execute_with_timeout(self, container_id: str, command: str, timeout: int) -> Tuple[bool, str, Optional[str]]:
         """Execute a command in a container with timeout."""
         try:
+            # Make sure we pass the current environment including DOCKER_HOST
+            env = os.environ.copy()
             result = subprocess.run(
                 ["docker", "exec", container_id, "sh", "-c", command],
                 capture_output=True,
                 text=True,
-                timeout=timeout
+                timeout=timeout,
+                env=env
             )
             if result.returncode == 0:
                 return True, result.stdout, None
             return False, None, result.stderr
         except subprocess.TimeoutExpired:
             # Kill and remove the container
-            subprocess.run(["docker", "kill", container_id], capture_output=True)
-            subprocess.run(["docker", "rm", container_id], capture_output=True)
+            env = os.environ.copy()
+            subprocess.run(["docker", "kill", container_id], capture_output=True, env=env)
+            subprocess.run(["docker", "rm", container_id], capture_output=True, env=env)
             # Remove from our tracking
             for package_hash, cid in list(self.containers.items()):
                 if cid == container_id:
@@ -183,9 +225,10 @@ USER codeuser
     
     def cleanup(self):
         """Clean up all containers."""
+        env = os.environ.copy()
         for container_id in self.containers.values():
             try:
-                subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
+                subprocess.run(["docker", "rm", "-f", container_id], capture_output=True, env=env)
             except Exception:
                 pass
         self.containers.clear()
