@@ -1,50 +1,12 @@
-import axios, { AxiosRequestConfig } from 'axios';
-
-// Define the type for Vite's import.meta.env
-interface ImportMetaEnv {
-  VITE_API_URL: string;
-  VITE_CF_ACCESS_CLIENT_ID: string;
-  VITE_CF_ACCESS_CLIENT_SECRET: string;
-}
-
-declare global {
-  interface ImportMeta {
-    env: ImportMetaEnv;
-  }
-}
+import axios from 'axios';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-const CF_ACCESS_CLIENT_ID = import.meta.env.VITE_CF_ACCESS_CLIENT_ID;
-const CF_ACCESS_CLIENT_SECRET = import.meta.env.VITE_CF_ACCESS_CLIENT_SECRET;
 
 export const api = axios.create({
   baseURL: API_URL,
   headers: {
     'Content-Type': 'application/json',
-    'CF-Access-Client-Id': CF_ACCESS_CLIENT_ID,
-    'CF-Access-Client-Secret': CF_ACCESS_CLIENT_SECRET,
   },
-  withCredentials: true,  // Enable sending cookies and auth headers
-  credentials: 'include',  // Explicitly set credentials to include
-});
-
-// Add request interceptor to ensure headers are set for all requests
-api.interceptors.request.use((config: AxiosRequestConfig) => {
-  // Ensure withCredentials is set for all requests
-  config.withCredentials = true;
-  
-  // Ensure Cloudflare Access headers are set for all requests including OPTIONS
-  if (config.headers) {
-    // These headers must be set for both the actual request and preflight
-    config.headers['CF-Access-Client-Id'] = CF_ACCESS_CLIENT_ID;
-    config.headers['CF-Access-Client-Secret'] = CF_ACCESS_CLIENT_SECRET;
-    
-    // Explicitly allow these headers in preflight
-    config.headers['Access-Control-Allow-Headers'] = 'CF-Access-Client-Id, CF-Access-Client-Secret, Content-Type';
-    config.headers['Access-Control-Allow-Credentials'] = 'true';
-  }
-  
-  return config;
 });
 
 export default api; 
