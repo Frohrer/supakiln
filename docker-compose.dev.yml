@@ -11,6 +11,13 @@ services:
       - NODE_ENV=development
     command: npm run dev
 
+  docker-daemon:
+    image: docker:dind
+    privileged: true
+    environment:
+      - DOCKER_TLS_CERTDIR=""  # Disable TLS for simplicity
+    command: ["dockerd", "--host=tcp://0.0.0.0:2376", "--host=unix:///var/run/docker.sock"]
+
   backend:
     build:
       context: .
@@ -18,7 +25,10 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/app
     environment:
+      - DOCKER_HOST=tcp://docker-daemon:2376
       - NODE_ENV=development
+    depends_on:
+      - docker-daemon
     command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload 

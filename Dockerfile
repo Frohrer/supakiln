@@ -13,9 +13,8 @@ RUN apt-get update && apt-get install -y \
     && apt-get install -y docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Create docker group and add user to it
-RUN groupadd -r docker || true && \
-    useradd -m -u 1000 -g docker codeuser || true
+# Create user
+RUN useradd -m -u 1000 codeuser
 
 # Set up Python environment
 ENV PYTHONUNBUFFERED=1
@@ -30,10 +29,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . .
 
-# Set proper permissions for Docker socket and app directory
-RUN chown -R codeuser:docker /app && \
-    chmod 660 /var/run/docker.sock || true && \
-    chmod 775 /var/run/docker.sock || true
+# Set proper permissions for app directory
+RUN chown -R codeuser:codeuser /app
 
 # Switch to non-root user
 USER codeuser

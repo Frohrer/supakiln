@@ -44,39 +44,47 @@ executor = CodeExecutor()
 
 # Initialize Docker client separately with proper error handling
 def get_docker_client():
-    """Get Docker client with proper error handling for DinD."""
+    """Get Docker client with proper error handling for DinD sidecar."""
     try:
-        # First, check if DOCKER_HOST has problematic values
+        # Check if DOCKER_HOST is set (for sidecar approach)
         docker_host = os.environ.get('DOCKER_HOST')
-        if docker_host and 'http+docker' in docker_host:
-            # Remove problematic DOCKER_HOST
-            print(f"Removing problematic DOCKER_HOST: {docker_host}")
-            del os.environ['DOCKER_HOST']
         
-        # For Docker-in-Docker, try the mounted socket path first
-        socket_paths = [
-            'unix:///var/run/docker.sock',  # Standard DinD mount
-            'unix://var/run/docker.sock',   # Alternative format
+        if docker_host:
+            print(f"Using DOCKER_HOST: {docker_host}")
+            # Connect directly to the specified host
+            client = docker.DockerClient(base_url=docker_host)
+            client.ping()
+            print("Successfully connected to Docker sidecar")
+            return client
+        
+        # Fallback: try to connect to sidecar on default port
+        sidecar_hosts = [
+            'tcp://docker-daemon:2376',  # Default sidecar name
+            'tcp://localhost:2376',      # If running locally
         ]
         
-        for socket_path in socket_paths:
+        for host in sidecar_hosts:
             try:
-                client = docker.DockerClient(base_url=socket_path)
-                # Test the connection
+                print(f"Trying Docker sidecar: {host}")
+                client = docker.DockerClient(base_url=host)
                 client.ping()
+                print(f"Successfully connected to Docker via {host}")
                 return client
-            except Exception:
+            except Exception as e:
+                print(f"Failed to connect via {host}: {e}")
                 continue
             
-        # Fallback to from_env() with cleaned environment
+        # Final fallback to from_env()
+        print("Trying Docker connection via from_env()")
         client = docker.from_env()
         client.ping()
+        print("Successfully connected to Docker via from_env()")
         return client
         
     except Exception as e:
         raise docker.errors.DockerException(
             f"Could not connect to Docker daemon. "
-            f"For Docker-in-Docker: ensure /var/run/docker.sock is mounted and accessible. "
+            f"For Docker sidecar: ensure docker-daemon service is running. "
             f"For native Linux: ensure Docker daemon is running (sudo systemctl start docker). "
             f"Original error: {e}"
         )

@@ -15,6 +15,13 @@ services:
     depends_on:
       - backend
 
+  docker-daemon:
+    image: docker:dind
+    privileged: true
+    environment:
+      - DOCKER_TLS_CERTDIR=""  # Disable TLS for simplicity
+    command: ["dockerd", "--host=tcp://0.0.0.0:2376", "--host=unix:///var/run/docker.sock"]
+
   backend:
     build:
       context: .
@@ -23,9 +30,10 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
-      - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      - DOCKER_HOST=tcp://docker-daemon:2376
       - BACKEND_URL=${BACKEND_URL}
       - BACKEND_WS_URL=${BACKEND_WS_URL}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
-    privileged: true  # Required for Docker-in-Docker 
+    depends_on:
+      - docker-daemon 
