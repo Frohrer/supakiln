@@ -24,10 +24,10 @@ allowed_origins = [
     for origin in os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
 ]
 
-# Add CORS middleware
+# Add CORS middleware with more permissive settings for Cloudflare Access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],  # Allow all origins temporarily for debugging
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
