@@ -41,6 +41,5 @@ USER codeuser
 # Expose port 8000
 EXPOSE 8000
 
-# Start the application with Docker socket configuration
-ENV DOCKER_HOST=unix:///var/run/docker.sock
+# Start the application
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"] 
