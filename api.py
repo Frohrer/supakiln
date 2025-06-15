@@ -21,17 +21,43 @@ app = FastAPI(title="Code Execution Engine API")
 # Get all allowed origins from environment variables
 allowed_origins = [
     origin.strip()
-    for origin in os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
+    for origin in os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000,https://localhost:3000').split(',')
 ]
 
-# Add CORS middleware with more permissive settings for Cloudflare Access
+# Add CORS middleware with proper settings for Cloudflare Access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins temporarily for debugging
+    allow_origins=allowed_origins if os.getenv('ENVIRONMENT') == 'production' else ["*"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=[
+        "Accept",
+        "Accept-Language",
+        "Content-Type",
+        "Content-Language",
+        "Authorization",
+        "X-Requested-With",
+        # Cloudflare Access headers
+        "CF-Access-Authenticated-User-Email",
+        "CF-Access-Client-Id",
+        "CF-Access-Client-Secret",
+        "CF-Access-Token",
+        "Cf-Access-Jwt-Assertion",
+        "X-Forwarded-For",
+        "X-Forwarded-Proto",
+        "X-Real-IP",
+        # Additional security headers
+        "X-CSRF-Token",
+        "X-API-Key",
+    ],
+    expose_headers=[
+        "X-Total-Count",
+        "X-Page-Count", 
+        "Link",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+    ],
     max_age=86400,  # Cache preflight requests for 24 hours
 )
 

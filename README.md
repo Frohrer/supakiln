@@ -170,6 +170,55 @@ If you're running on Windows, ensure Docker Desktop is configured to use the WSL
 - Monaco Editor (loaded via CDN)
 - Bootstrap 5 (loaded via CDN)
 
+## Cloudflare Access Integration
+
+This application includes support for Cloudflare Access service authentication for secure API requests.
+
+### Configuration
+
+#### Backend CORS Settings
+The backend automatically configures CORS headers to support Cloudflare Access, including:
+- `CF-Access-Authenticated-User-Email`
+- `CF-Access-Client-Id` 
+- `CF-Access-Client-Secret`
+- `CF-Access-Token`
+- `Cf-Access-Jwt-Assertion`
+
+#### Frontend Configuration
+To configure Cloudflare service authentication in the frontend:
+
+1. **Copy the example configuration:**
+   ```bash
+   cp frontend/config.example.env frontend/.env
+   ```
+
+2. **Update the environment variables:**
+   ```env
+   # Get these values from your Cloudflare Access dashboard
+   VITE_CF_CLIENT_ID=your_cloudflare_client_id_here
+   VITE_CF_CLIENT_SECRET=your_cloudflare_client_secret_here
+   VITE_CF_ACCESS_TOKEN=your_cloudflare_access_token_here
+   ```
+
+3. **Obtain Cloudflare credentials:**
+   - Go to your Cloudflare Zero Trust dashboard
+   - Navigate to Access → Service Auth
+   - Create or select your service token
+   - Copy the Client ID, Client Secret, and Access Token
+
+#### Environment Variables
+- `VITE_CF_CLIENT_ID`: Your Cloudflare Access Client ID
+- `VITE_CF_CLIENT_SECRET`: Your Cloudflare Access Client Secret  
+- `VITE_CF_ACCESS_TOKEN`: Your Cloudflare Access Token
+- `ALLOWED_ORIGINS`: Comma-separated list of allowed origins for CORS
+- `ENVIRONMENT`: Set to `production` to enforce stricter CORS origins
+
+### Production Deployment
+For production deployments:
+1. Set `ENVIRONMENT=production` to enforce CORS origin restrictions
+2. Configure `ALLOWED_ORIGINS` with your actual frontend domains
+3. Ensure all Cloudflare service auth tokens are properly configured
+
 ## License
 
 MIT License # supakiln
