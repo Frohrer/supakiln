@@ -12,6 +12,10 @@ services:
       - VITE_API_URL=${VITE_API_URL}
       - VITE_WS_URL=${VITE_WS_URL}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      # Cloudflare Access Service Auth
+      - VITE_CF_CLIENT_ID=${VITE_CF_CLIENT_ID}
+      - VITE_CF_CLIENT_SECRET=${VITE_CF_CLIENT_SECRET}
+      - VITE_CF_ACCESS_TOKEN=${VITE_CF_ACCESS_TOKEN}
     depends_on:
       - backend
 
@@ -41,6 +45,7 @@ services:
       - BACKEND_URL=${BACKEND_URL}
       - BACKEND_WS_URL=${BACKEND_WS_URL}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
     depends_on:
       docker-daemon:
         condition: service_healthy 
