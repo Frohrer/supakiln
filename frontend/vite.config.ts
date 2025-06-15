@@ -20,8 +20,8 @@ export default defineConfig(({ mode }) => {
       } : false  // Disable HMR in production
     },
     build: {
-      // Optimize for production
-      minify: 'terser',
+      // Optimize for production - using esbuild (default, faster than terser)
+      minify: 'esbuild',
       sourcemap: false,
       rollupOptions: {
         output: {
