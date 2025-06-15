@@ -16,6 +16,7 @@ from datetime import datetime
 import base64
 from env_manager import EnvironmentManager, EnvironmentVariable
 
+
 app = FastAPI(title="Code Execution Engine API")
 
 # Get all allowed origins from environment variables
@@ -123,6 +124,8 @@ except docker.errors.DockerException as e:
     print(f"Error initializing Docker: {str(e)}")
     print("Please ensure Docker is running and you have the necessary permissions.")
     raise
+
+
 
 class CodeExecutionRequest(BaseModel):
     code: Optional[str] = None
@@ -294,7 +297,7 @@ async def get_container(container_id: str):
         # Try to get the code from the container
         code = None
         try:
-            result = container.exec_run("cat /tmp/code.py", timeout=5)
+            result = container.exec_run("cat /tmp/code.py")
             if result.exit_code == 0:
                 code = result.output.decode()
         except Exception:
@@ -370,8 +373,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             # Execute with environment variables
             result = container.exec_run(
                 f"python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
-                environment=env_vars,
-                timeout=request.timeout
+                environment=env_vars
             )
             
             output = result.output.decode() if result.exit_code == 0 else None
@@ -430,8 +432,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             
             result = container.exec_run(
                 f"python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
-                environment=env_vars,
-                timeout=request.timeout
+                environment=env_vars
             )
             
             output = result.output.decode() if result.exit_code == 0 else None
