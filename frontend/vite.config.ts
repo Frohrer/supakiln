@@ -13,10 +13,23 @@ export default defineConfig(({ mode }) => {
       watch: {
         usePolling: true
       },
-      hmr: {
+      hmr: mode === 'development' ? {
         protocol: 'wss',
-        host: new URL(env.VITE_FRONTEND_URL).hostname,
+        host: new URL(env.VITE_FRONTEND_URL || 'https://localhost:3000').hostname,
         clientPort: 443
+      } : false  // Disable HMR in production
+    },
+    build: {
+      // Optimize for production
+      minify: 'terser',
+      sourcemap: false,
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            vendor: ['react', 'react-dom'],
+            ui: ['@mui/material', '@mui/icons-material']
+          }
+        }
       }
     }
   }

@@ -9,7 +9,19 @@ RUN npm install
 # Copy the rest of the application
 COPY . .
 
-# Build the application
+# Accept build arguments for environment variables
+ARG VITE_API_URL
+ARG VITE_CF_CLIENT_ID
+ARG VITE_CF_CLIENT_SECRET
+ARG VITE_CF_ACCESS_TOKEN
+
+# Set environment variables for build
+ENV VITE_API_URL=$VITE_API_URL
+ENV VITE_CF_CLIENT_ID=$VITE_CF_CLIENT_ID
+ENV VITE_CF_CLIENT_SECRET=$VITE_CF_CLIENT_SECRET
+ENV VITE_CF_ACCESS_TOKEN=$VITE_CF_ACCESS_TOKEN
+
+# Build the application with environment variables
 RUN npm run build
 
 # Install serve to run the application
