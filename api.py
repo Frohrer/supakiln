@@ -801,8 +801,8 @@ import json
 import sys
 from datetime import datetime
 
-# Request data available to the webhook code
-request_data = {json.dumps(request_data)}
+# Request data available to the webhook code (properly converted from JSON)
+request_data = json.loads('''{json.dumps(request_data)}''')
 
 # Default response
 response_data = {{"message": "Webhook executed successfully", "timestamp": datetime.now().isoformat()}}
@@ -827,7 +827,10 @@ print(json.dumps(response_data))
             container = docker_client.containers.get(job.container_id)
         else:
             # Create/get container with packages
-            packages = job.packages.split(',') if job.packages else []
+            packages = []
+            if job.packages and job.packages.strip():
+                packages = [pkg.strip() for pkg in job.packages.split(',') if pkg.strip()]
+            
             package_hash = executor._get_package_hash(packages)
             image_tag = executor._build_image(packages)
             
