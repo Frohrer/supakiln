@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,38 +19,16 @@ from env_manager import EnvironmentManager, EnvironmentVariable
 
 app = FastAPI(title="Code Execution Engine API")
 
-# Get all allowed origins from environment variables
-allowed_origins = [
-    origin.strip()
-    for origin in os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000,https://localhost:3000').split(',')
-]
+# Since Cloudflare handles CORS filtering and bypasses OPTIONS requests to origin,
+# we use permissive CORS settings and let Cloudflare Access handle the security
 
-# Add CORS middleware with proper settings for Cloudflare Access
+# Add CORS middleware with permissive settings since Cloudflare bypasses OPTIONS to origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins if os.getenv('ENVIRONMENT') == 'production' else ["*"],
+    allow_origins=["*"],  # Allow all origins since Cloudflare handles the actual filtering
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=[
-        "Accept",
-        "Accept-Language",
-        "Content-Type",
-        "Content-Language",
-        "Authorization",
-        "X-Requested-With",
-        # Cloudflare Access headers
-        "CF-Access-Authenticated-User-Email",
-        "CF-Access-Client-Id",
-        "CF-Access-Client-Secret",
-        "CF-Access-Token",
-        "Cf-Access-Jwt-Assertion",
-        "X-Forwarded-For",
-        "X-Forwarded-Proto",
-        "X-Real-IP",
-        # Additional security headers
-        "X-CSRF-Token",
-        "X-API-Key",
-    ],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
     expose_headers=[
         "X-Total-Count",
         "X-Page-Count", 
@@ -61,6 +39,16 @@ app.add_middleware(
     ],
     max_age=86400,  # Cache preflight requests for 24 hours
 )
+
+
+# Add a health check endpoint that bypasses Cloudflare Access
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint that should bypass Cloudflare Access.
+    Configure this endpoint to be public in your Cloudflare Access rules.
+    """
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 # Mount static files - update the path to be relative to the current file
 static_dir = os.path.join(os.path.dirname(__file__), "static")
