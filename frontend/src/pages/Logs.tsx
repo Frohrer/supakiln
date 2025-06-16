@@ -25,6 +25,7 @@ import api from '../config/api';
 interface Log {
   id: number;
   job_id: number | null;
+  webhook_job_id: number | null;
   code: string;
   output: string | null;
   error: string | null;
@@ -32,6 +33,8 @@ interface Log {
   execution_time: number;
   started_at: string;
   status: string;
+  request_data: string | null;
+  response_data: string | null;
 }
 
 const Logs: React.FC = () => {
@@ -119,7 +122,8 @@ const Logs: React.FC = () => {
             <TableHead>
               <TableRow>
                 <TableCell>Time</TableCell>
-                <TableCell>Job ID</TableCell>
+                <TableCell>Type</TableCell>
+                <TableCell>Job/Webhook ID</TableCell>
                 <TableCell>Status</TableCell>
                 <TableCell>Duration (s)</TableCell>
                 <TableCell>Actions</TableCell>
@@ -133,7 +137,12 @@ const Logs: React.FC = () => {
                   sx={{ cursor: 'pointer' }}
                 >
                   <TableCell>{new Date(log.started_at).toLocaleString()}</TableCell>
-                  <TableCell>{log.job_id || 'Manual'}</TableCell>
+                  <TableCell>
+                    {log.webhook_job_id ? 'Webhook' : log.job_id ? 'Scheduled' : 'Manual'}
+                  </TableCell>
+                  <TableCell>
+                    {log.webhook_job_id ? `W-${log.webhook_job_id}` : log.job_id ? `S-${log.job_id}` : 'Manual'}
+                  </TableCell>
                   <TableCell>{log.status}</TableCell>
                   <TableCell>{log.execution_time.toFixed(2)}</TableCell>
                   <TableCell>

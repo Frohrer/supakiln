@@ -4,6 +4,7 @@ import { createTheme } from '@mui/material/styles';
 import Layout from './components/Layout';
 import Editor from './pages/Editor';
 import Scheduler from './pages/Scheduler';
+import WebhookJobs from './pages/WebhookJobs';
 import Logs from './pages/Logs';
 import Containers from './pages/Containers';
 import EnvironmentVariables from './pages/EnvironmentVariables';
@@ -30,6 +31,7 @@ function App() {
             <Route path="/" element={<Editor />} />
             <Route path="/containers" element={<Containers />} />
             <Route path="/scheduler" element={<Scheduler />} />
+            <Route path="/webhooks" element={<WebhookJobs />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/env" element={<EnvironmentVariables />} />
           </Routes>

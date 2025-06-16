@@ -8,12 +8,13 @@ import uvicorn
 from code_executor import CodeExecutor
 import docker
 import os
-from models import SessionLocal, ScheduledJob, ExecutionLog
+from models import SessionLocal, ScheduledJob, ExecutionLog, WebhookJob
 from scheduler import scheduler
 from sqlalchemy.orm import Session
 import time
 from datetime import datetime
 import base64
+import json
 from env_manager import EnvironmentManager, EnvironmentVariable
 
 
@@ -153,6 +154,7 @@ class ScheduledJobResponse(BaseModel):
 class ExecutionLogResponse(BaseModel):
     id: int
     job_id: Optional[int]
+    webhook_job_id: Optional[int]
     code: str
     output: Optional[str]
     error: Optional[str]
@@ -160,6 +162,8 @@ class ExecutionLogResponse(BaseModel):
     execution_time: float
     started_at: str
     status: str
+    request_data: Optional[str]
+    response_data: Optional[str]
 
 class EnvVarRequest(BaseModel):
     name: str
@@ -169,6 +173,28 @@ class EnvVarResponse(BaseModel):
     name: str
     created_at: str
     updated_at: str
+
+class WebhookJobRequest(BaseModel):
+    name: str
+    endpoint: str  # URL path like /webhook/my-job
+    code: str
+    container_id: Optional[str] = None
+    packages: Optional[List[str]] = None
+    timeout: Optional[int] = 30
+    description: Optional[str] = None
+
+class WebhookJobResponse(BaseModel):
+    id: int
+    name: str
+    endpoint: str
+    code: str
+    container_id: Optional[str]
+    packages: Optional[str]
+    created_at: str
+    last_triggered: Optional[str]
+    is_active: bool
+    timeout: int
+    description: Optional[str]
 
 # Store container names
 container_names = {}  # container_id -> name
@@ -566,9 +592,345 @@ async def delete_scheduled_job(job_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Webhook Jobs endpoints
+@app.post("/webhook-jobs", response_model=WebhookJobResponse)
+async def create_webhook_job(request: WebhookJobRequest, db: Session = Depends(get_db)):
+    """Create a new webhook job."""
+    try:
+        # Validate endpoint format
+        if not request.endpoint.startswith('/'):
+            request.endpoint = '/' + request.endpoint
+        
+        # Check if endpoint already exists
+        existing = db.query(WebhookJob).filter(WebhookJob.endpoint == request.endpoint).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Endpoint already exists")
+        
+        # Create job in database
+        db_job = WebhookJob(
+            name=request.name,
+            endpoint=request.endpoint,
+            code=request.code,
+            packages=','.join(request.packages) if request.packages else None,
+            container_id=request.container_id,
+            timeout=request.timeout,
+            description=request.description,
+            created_at=datetime.now(),
+            is_active=True
+        )
+        db.add(db_job)
+        db.commit()
+        db.refresh(db_job)
+        
+        return {
+            "id": db_job.id,
+            "name": db_job.name,
+            "endpoint": db_job.endpoint,
+            "code": db_job.code,
+            "packages": db_job.packages,
+            "container_id": db_job.container_id,
+            "created_at": db_job.created_at.isoformat(),
+            "last_triggered": db_job.last_triggered.isoformat() if db_job.last_triggered else None,
+            "is_active": db_job.is_active,
+            "timeout": db_job.timeout,
+            "description": db_job.description
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/webhook-jobs", response_model=List[WebhookJobResponse])
+async def list_webhook_jobs(db: Session = Depends(get_db)):
+    """List all webhook jobs."""
+    jobs = db.query(WebhookJob).all()
+    return [
+        {
+            "id": job.id,
+            "name": job.name,
+            "endpoint": job.endpoint,
+            "code": job.code,
+            "packages": job.packages,
+            "container_id": job.container_id,
+            "created_at": job.created_at.isoformat(),
+            "last_triggered": job.last_triggered.isoformat() if job.last_triggered else None,
+            "is_active": job.is_active,
+            "timeout": job.timeout,
+            "description": job.description
+        }
+        for job in jobs
+    ]
+
+@app.get("/webhook-jobs/{job_id}", response_model=WebhookJobResponse)
+async def get_webhook_job(job_id: int, db: Session = Depends(get_db)):
+    """Get a specific webhook job."""
+    job = db.query(WebhookJob).filter(WebhookJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Webhook job not found")
+    return {
+        "id": job.id,
+        "name": job.name,
+        "endpoint": job.endpoint,
+        "code": job.code,
+        "packages": job.packages,
+        "container_id": job.container_id,
+        "created_at": job.created_at.isoformat(),
+        "last_triggered": job.last_triggered.isoformat() if job.last_triggered else None,
+        "is_active": job.is_active,
+        "timeout": job.timeout,
+        "description": job.description
+    }
+
+@app.put("/webhook-jobs/{job_id}", response_model=WebhookJobResponse)
+async def update_webhook_job(job_id: int, request: WebhookJobRequest, db: Session = Depends(get_db)):
+    """Update a webhook job."""
+    try:
+        job = db.query(WebhookJob).filter(WebhookJob.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Webhook job not found")
+        
+        # Validate endpoint format
+        if not request.endpoint.startswith('/'):
+            request.endpoint = '/' + request.endpoint
+        
+        # Check if endpoint already exists (excluding current job)
+        existing = db.query(WebhookJob).filter(
+            WebhookJob.endpoint == request.endpoint,
+            WebhookJob.id != job_id
+        ).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Endpoint already exists")
+        
+        # Update job
+        job.name = request.name
+        job.endpoint = request.endpoint
+        job.code = request.code
+        job.packages = ','.join(request.packages) if request.packages else None
+        job.container_id = request.container_id
+        job.timeout = request.timeout
+        job.description = request.description
+        
+        db.commit()
+        db.refresh(job)
+        
+        return {
+            "id": job.id,
+            "name": job.name,
+            "endpoint": job.endpoint,
+            "code": job.code,
+            "packages": job.packages,
+            "container_id": job.container_id,
+            "created_at": job.created_at.isoformat(),
+            "last_triggered": job.last_triggered.isoformat() if job.last_triggered else None,
+            "is_active": job.is_active,
+            "timeout": job.timeout,
+            "description": job.description
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/webhook-jobs/{job_id}")
+async def delete_webhook_job(job_id: int, db: Session = Depends(get_db)):
+    """Delete a webhook job."""
+    try:
+        job = db.query(WebhookJob).filter(WebhookJob.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Webhook job not found")
+        
+        db.delete(job)
+        db.commit()
+        return {"message": "Webhook job deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Dynamic webhook execution endpoint
+@app.api_route("/webhook/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def execute_webhook(path: str, request: Request, db: Session = Depends(get_db)):
+    """
+    Dynamic endpoint that executes webhook jobs based on the path.
+    Supports all HTTP methods and passes request data to the code.
+    """
+    start_time = time.time()
+    endpoint = f"/{path}"
+    
+    try:
+        # Find the webhook job
+        job = db.query(WebhookJob).filter(
+            WebhookJob.endpoint == endpoint,
+            WebhookJob.is_active == 1
+        ).first()
+        
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Webhook endpoint '{endpoint}' not found")
+        
+        # Get request data
+        request_method = request.method
+        request_headers = dict(request.headers)
+        request_query_params = dict(request.query_params)
+        
+        # Get request body
+        request_body = None
+        try:
+            if request_method in ["POST", "PUT", "PATCH"]:
+                content_type = request_headers.get("content-type", "")
+                if "application/json" in content_type:
+                    request_body = await request.json()
+                elif "application/x-www-form-urlencoded" in content_type:
+                    form_data = await request.form()
+                    request_body = dict(form_data)
+                else:
+                    request_body = (await request.body()).decode()
+        except Exception as e:
+            print(f"Error parsing request body: {e}")
+            request_body = None
+        
+        # Prepare the execution context
+        request_data = {
+            "method": request_method,
+            "headers": request_headers,
+            "query_params": request_query_params,
+            "body": request_body,
+            "endpoint": endpoint
+        }
+        
+        # Prepare the code with request context
+        # The webhook code will have access to 'request_data' and should set 'response_data'
+        wrapper_code = f"""
+import json
+import sys
+from datetime import datetime
+
+# Request data available to the webhook code
+request_data = {json.dumps(request_data)}
+
+# Default response
+response_data = {{"message": "Webhook executed successfully", "timestamp": datetime.now().isoformat()}}
+
+# User's webhook code
+try:
+{chr(10).join("    " + line for line in job.code.split(chr(10)))}
+except Exception as e:
+    response_data = {{"error": str(e), "timestamp": datetime.now().isoformat()}}
+    print(f"Error in webhook code: {{e}}", file=sys.stderr)
+
+# Output the response (this will be captured and returned)
+print(json.dumps(response_data))
+"""
+        
+        # Execute the webhook code
+        if job.container_id:
+            # Use existing container
+            if job.container_id not in executor.containers.values():
+                raise HTTPException(status_code=500, detail="Webhook job container not found")
+            
+            container = docker_client.containers.get(job.container_id)
+        else:
+            # Create/get container with packages
+            packages = job.packages.split(',') if job.packages else []
+            package_hash = executor._get_package_hash(packages)
+            image_tag = executor._build_image(packages)
+            
+            if package_hash not in executor.containers:
+                container = docker_client.containers.run(
+                    image_tag,
+                    detach=True,
+                    tty=True,
+                    mem_limit="512m",
+                    cpu_period=100000,
+                    cpu_quota=50000
+                )
+                executor.containers[package_hash] = container.id
+            
+            container_id = executor.containers[package_hash]
+            container = docker_client.containers.get(container_id)
+        
+        # Get environment variables
+        env_manager = get_env_manager()
+        env_vars = env_manager.get_all_variables()
+        
+        # Execute with timeout
+        encoded_code = base64.b64encode(wrapper_code.encode()).decode()
+        
+        result = container.exec_run(
+            f"timeout {job.timeout} python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
+            environment=env_vars
+        )
+        
+        # Parse the output
+        success = result.exit_code == 0
+        output = result.output.decode() if result.output else ""
+        
+        # Try to parse the response data from output
+        response_data = None
+        if success and output.strip():
+            try:
+                # The last line should be the JSON response
+                lines = output.strip().split('\n')
+                for line in reversed(lines):
+                    line = line.strip()
+                    if line.startswith('{') and line.endswith('}'):
+                        response_data = json.loads(line)
+                        break
+            except Exception as e:
+                print(f"Error parsing webhook response: {e}")
+                response_data = {"output": output}
+        
+        if not response_data:
+            response_data = {
+                "success": success,
+                "output": output if success else None,
+                "error": output if not success else None
+            }
+        
+        # Update job last triggered time
+        job.last_triggered = datetime.utcnow()
+        db.commit()
+        
+        # Log the execution
+        log = ExecutionLog(
+            webhook_job_id=job.id,
+            code=job.code,
+            output=json.dumps(response_data) if success else None,
+            error=output if not success else None,
+            container_id=container.id,
+            execution_time=time.time() - start_time,
+            started_at=datetime.utcnow(),
+            status="success" if success else "error",
+            request_data=json.dumps(request_data),
+            response_data=json.dumps(response_data) if success else None
+        )
+        db.add(log)
+        db.commit()
+        
+        # Return the response
+        if success:
+            return response_data
+        else:
+            raise HTTPException(status_code=500, detail=response_data.get("error", "Webhook execution failed"))
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Log the error
+        log = ExecutionLog(
+            webhook_job_id=job.id if 'job' in locals() else None,
+            code=job.code if 'job' in locals() else "",
+            error=str(e),
+            execution_time=time.time() - start_time,
+            started_at=datetime.utcnow(),
+            status="error",
+            request_data=json.dumps(request_data) if 'request_data' in locals() else None
+        )
+        db.add(log)
+        db.commit()
+        
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/logs", response_model=List[ExecutionLogResponse])
 async def get_execution_logs(
     job_id: Optional[int] = None,
+    webhook_job_id: Optional[int] = None,
     limit: int = 100,
     offset: int = 0,
     db: Session = Depends(get_db)
@@ -577,13 +939,25 @@ async def get_execution_logs(
     query = db.query(ExecutionLog)
     if job_id is not None:
         query = query.filter(ExecutionLog.job_id == job_id)
+    if webhook_job_id is not None:
+        query = query.filter(ExecutionLog.webhook_job_id == webhook_job_id)
     logs = query.order_by(ExecutionLog.started_at.desc()).offset(offset).limit(limit).all()
     
     # Convert logs to response format with datetime as ISO string
     return [
         {
-            **log.__dict__,
-            'started_at': log.started_at.isoformat() if log.started_at else None
+            "id": log.id,
+            "job_id": log.job_id,
+            "webhook_job_id": log.webhook_job_id,
+            "code": log.code,
+            "output": log.output,
+            "error": log.error,
+            "container_id": log.container_id,
+            "execution_time": log.execution_time,
+            "started_at": log.started_at.isoformat() if log.started_at else None,
+            "status": log.status,
+            "request_data": log.request_data,
+            "response_data": log.response_data
         }
         for log in logs
     ]
@@ -597,8 +971,18 @@ async def get_execution_log(log_id: int, db: Session = Depends(get_db)):
     
     # Convert log to response format with datetime as ISO string
     return {
-        **log.__dict__,
-        'started_at': log.started_at.isoformat() if log.started_at else None
+        "id": log.id,
+        "job_id": log.job_id,
+        "webhook_job_id": log.webhook_job_id,
+        "code": log.code,
+        "output": log.output,
+        "error": log.error,
+        "container_id": log.container_id,
+        "execution_time": log.execution_time,
+        "started_at": log.started_at.isoformat() if log.started_at else None,
+        "status": log.status,
+        "request_data": log.request_data,
+        "response_data": log.response_data
     }
 
 @app.post("/env", response_model=EnvVarResponse)

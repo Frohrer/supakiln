@@ -23,6 +23,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
     { path: '/', label: 'Editor' },
     { path: '/containers', label: 'Containers' },
     { path: '/scheduler', label: 'Scheduler' },
+    { path: '/webhooks', label: 'Webhooks' },
     { path: '/logs', label: 'Logs' },
     { path: '/env', label: 'Environment Variables' },
   ];
