@@ -7,8 +7,8 @@ services:
       dockerfile: Dockerfile
       args:
         - VITE_API_URL=${VITE_API_URL}
-        - VITE_CF_CLIENT_ID=${VITE_CF_CLIENT_ID}
-        - VITE_CF_CLIENT_SECRET=${VITE_CF_CLIENT_SECRET}
+        - VITE_CF_CLIENT_ID=${VITE_CF_ACCESS_CLIENT_ID}
+        - VITE_CF_CLIENT_SECRET=${VITE_CF_ACCESS_CLIENT_SECRET}
         - VITE_CF_ACCESS_TOKEN=${VITE_CF_ACCESS_TOKEN}
     ports:
       - "3000:3000"
@@ -17,8 +17,8 @@ services:
       - VITE_API_URL=${VITE_API_URL}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       # Cloudflare Access Service Auth
-      - VITE_CF_CLIENT_ID=${VITE_CF_CLIENT_ID}
-      - VITE_CF_CLIENT_SECRET=${VITE_CF_CLIENT_SECRET}
+      - VITE_CF_CLIENT_ID=${VITE_CF_ACCESS_CLIENT_ID}
+      - VITE_CF_CLIENT_SECRET=${VITE_CF_ACCESS_CLIENT_SECRET}
       - VITE_CF_ACCESS_TOKEN=${VITE_CF_ACCESS_TOKEN}
     depends_on:
       - backend
