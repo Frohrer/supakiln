@@ -795,14 +795,18 @@ async def execute_webhook(path: str, request: Request, db: Session = Depends(get
         }
         
         # Prepare the code with request context
+        # Encode the request data safely using base64
+        request_data_encoded = base64.b64encode(json.dumps(request_data).encode()).decode()
+        
         # The webhook code will have access to 'request_data' and should set 'response_data'
         wrapper_code = f"""
 import json
 import sys
+import base64
 from datetime import datetime
 
-# Request data available to the webhook code (properly converted from JSON)
-request_data = json.loads('''{json.dumps(request_data)}''')
+# Request data available to the webhook code (safely decoded from base64)
+request_data = json.loads(base64.b64decode("{request_data_encoded}").decode())
 
 # Default response
 response_data = {{"message": "Webhook executed successfully", "timestamp": datetime.now().isoformat()}}
