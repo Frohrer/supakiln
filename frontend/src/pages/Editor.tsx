@@ -93,9 +93,9 @@ const CodeEditor: React.FC = () => {
   };
 
   return (
-    <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column', p: 2 }}>
+    <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
       {/* Top toolbar */}
-      <Box sx={{ display: 'flex', alignItems: 'center', mb: 2, gap: 2 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', mb: 2, gap: 2, px: 2, py: 1 }}>
         <Button
           variant="contained"
           startIcon={<PlayIcon />}
@@ -139,7 +139,7 @@ const CodeEditor: React.FC = () => {
       </Box>
 
       {/* Main content area */}
-      <Box sx={{ display: 'flex', flexGrow: 1, gap: 2, minHeight: 0 }}>
+      <Box sx={{ display: 'flex', flexGrow: 1, gap: 1, minHeight: 0 }}>
         {/* Left side - Code editor */}
         <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
           <Paper sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
@@ -160,7 +160,7 @@ const CodeEditor: React.FC = () => {
         </Box>
 
         {/* Right side - Settings and Output */}
-        <Box sx={{ width: '400px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+        <Box sx={{ width: '400px', display: 'flex', flexDirection: 'column', gap: 2, pr: 2 }}>
           {/* Settings panel */}
           <Paper sx={{ p: 2 }}>
             <Typography variant="h6" gutterBottom>
