@@ -13,6 +13,7 @@ class EnvironmentVariable(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True, nullable=False)
     value = Column(String, nullable=False)  # Encrypted value
+    description = Column(String)  # Optional description
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -29,7 +30,7 @@ class EnvironmentManager:
             with open('.env_key', 'wb') as key_file:
                 key_file.write(key)
 
-    def set_variable(self, name: str, value: str) -> None:
+    def set_variable(self, name: str, value: str, description: str = None) -> None:
         """Set an environment variable with encryption."""
         encrypted_value = self.fernet.encrypt(value.encode())
         var = self.db.query(EnvironmentVariable).filter_by(name=name).first()
@@ -37,10 +38,13 @@ class EnvironmentManager:
         if var:
             var.value = encrypted_value.decode()
             var.updated_at = datetime.utcnow()
+            if description is not None:
+                var.description = description
         else:
             var = EnvironmentVariable(
                 name=name,
-                value=encrypted_value.decode()
+                value=encrypted_value.decode(),
+                description=description
             )
             self.db.add(var)
         
@@ -57,6 +61,31 @@ class EnvironmentManager:
             return decrypted_value.decode()
         except Exception:
             return None
+
+    def get_variable_metadata(self, name: str) -> dict:
+        """Get environment variable metadata without the value."""
+        var = self.db.query(EnvironmentVariable).filter_by(name=name).first()
+        if not var:
+            return None
+        
+        return {
+            "name": var.name,
+            "description": var.description,
+            "created_at": var.created_at.isoformat(),
+            "updated_at": var.updated_at.isoformat()
+        }
+
+    def list_variables_with_metadata(self) -> list:
+        """List all environment variables with metadata but without values."""
+        variables = []
+        for var in self.db.query(EnvironmentVariable).all():
+            variables.append({
+                "name": var.name,
+                "description": var.description,
+                "created_at": var.created_at.isoformat(),
+                "updated_at": var.updated_at.isoformat()
+            })
+        return variables
 
     def delete_variable(self, name: str) -> bool:
         """Delete an environment variable."""

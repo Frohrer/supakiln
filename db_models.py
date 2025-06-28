@@ -12,6 +12,7 @@ class EnvironmentVariable(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(100), unique=True, nullable=False)
     value = Column(Text, nullable=False)  # Encrypted value
+    description = Column(Text)  # Optional description
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -43,19 +44,38 @@ class WebhookJob(Base):
     timeout = Column(Integer, default=30)  # Timeout in seconds
     description = Column(Text)  # Optional description
 
+class PersistentService(Base):
+    __tablename__ = "persistent_services"
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    code = Column(Text, nullable=False)
+    container_id = Column(String(100))
+    packages = Column(Text)  # Stored as comma-separated string
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime)
+    last_restart = Column(DateTime)
+    is_active = Column(Integer, default=1)  # 1 for active, 0 for inactive
+    status = Column(String(20), default="stopped")  # stopped, starting, running, error, restarting
+    restart_policy = Column(String(20), default="always")  # always, never, on-failure
+    description = Column(Text)  # Optional description
+    process_id = Column(String(100))  # Docker exec process ID for running services
+    auto_start = Column(Integer, default=1)  # 1 to auto-start on system startup
+
 class ExecutionLog(Base):
     __tablename__ = "execution_logs"
     
     id = Column(Integer, primary_key=True)
     job_id = Column(Integer)  # Null for manual executions
     webhook_job_id = Column(Integer)  # For webhook job executions
+    service_id = Column(Integer)  # For persistent service executions
     code = Column(Text, nullable=False)
     output = Column(Text)
     error = Column(Text)
     container_id = Column(String(100))
     execution_time = Column(Float)  # in seconds
     started_at = Column(DateTime, default=datetime.utcnow)
-    status = Column(String(20))  # success, error, timeout
+    status = Column(String(20))  # success, error, timeout, running
     request_data = Column(Text)  # For webhook jobs: the request payload
     response_data = Column(Text)  # For webhook jobs: the response payload
 

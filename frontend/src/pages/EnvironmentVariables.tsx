@@ -22,23 +22,29 @@ import EditIcon from '@mui/icons-material/Edit';
 import AddIcon from '@mui/icons-material/Add';
 import { api } from '../config/api';
 
-interface EnvVar {
+interface EnvVarMetadata {
   name: string;
-  value: string;
+  description?: string;
   created_at: string;
   updated_at: string;
 }
 
+interface EnvVar {
+  name: string;
+  value: string;
+  description?: string;
+}
+
 export default function EnvironmentVariables() {
-  const [variables, setVariables] = useState<string[]>([]);
+  const [variables, setVariables] = useState<EnvVarMetadata[]>([]);
   const [selectedVar, setSelectedVar] = useState<EnvVar | null>(null);
   const [openDialog, setOpenDialog] = useState(false);
-  const [newVar, setNewVar] = useState({ name: '', value: '' });
+  const [newVar, setNewVar] = useState({ name: '', value: '', description: '' });
   const [error, setError] = useState('');
 
   const fetchVariables = async () => {
     try {
-      const response = await api.get<string[]>('/env');
+      const response = await api.get<EnvVarMetadata[]>('/env-metadata');
       setVariables(response.data);
     } catch (err) {
       console.error('Error fetching variables:', err);
@@ -50,15 +56,28 @@ export default function EnvironmentVariables() {
     fetchVariables();
   }, []);
 
-  const handleOpenDialog = (variable?: string) => {
-    if (variable) {
-      api.get<EnvVar>(`/env/${variable}`).then(response => {
-        setSelectedVar(response.data);
-        setNewVar({ name: response.data.name, value: response.data.value });
+  const handleOpenDialog = (variableName?: string) => {
+    if (variableName) {
+      // Get the variable value for editing
+      api.get<{ name: string; value: string }>(`/env/${variableName}`).then((response: any) => {
+        const metadata = variables.find((v: EnvVarMetadata) => v.name === variableName);
+        setSelectedVar({
+          name: response.data.name,
+          value: response.data.value,
+          description: metadata?.description || ''
+        });
+        setNewVar({ 
+          name: response.data.name, 
+          value: response.data.value,
+          description: metadata?.description || ''
+        });
+      }).catch((err: any) => {
+        console.error('Error fetching variable value:', err);
+        setError('Failed to fetch variable details');
       });
     } else {
       setSelectedVar(null);
-      setNewVar({ name: '', value: '' });
+      setNewVar({ name: '', value: '', description: '' });
     }
     setOpenDialog(true);
   };
@@ -66,7 +85,7 @@ export default function EnvironmentVariables() {
   const handleCloseDialog = () => {
     setOpenDialog(false);
     setSelectedVar(null);
-    setNewVar({ name: '', value: '' });
+    setNewVar({ name: '', value: '', description: '' });
     setError('');
   };
 
@@ -77,7 +96,7 @@ export default function EnvironmentVariables() {
         return;
       }
 
-      await api.post<EnvVar>('/env', newVar);
+      await api.post('/env', newVar);
       handleCloseDialog();
       fetchVariables();
     } catch (err) {
@@ -96,6 +115,10 @@ export default function EnvironmentVariables() {
         setError('Failed to delete environment variable');
       }
     }
+  };
+
+  const formatDate = (dateString: string) => {
+    return new Date(dateString).toLocaleString();
   };
 
   return (
@@ -122,26 +145,26 @@ export default function EnvironmentVariables() {
           <TableHead>
             <TableRow>
               <TableCell>Name</TableCell>
+              <TableCell>Description</TableCell>
               <TableCell>Last Updated</TableCell>
               <TableCell align="right">Actions</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
-            {variables.map((name) => (
-              <TableRow key={name}>
-                <TableCell>{name}</TableCell>
-                <TableCell>
-                  {selectedVar?.name === name ? selectedVar.updated_at : ''}
-                </TableCell>
+            {variables.map((variable: EnvVarMetadata) => (
+              <TableRow key={variable.name}>
+                <TableCell>{variable.name}</TableCell>
+                <TableCell>{variable.description || '-'}</TableCell>
+                <TableCell>{formatDate(variable.updated_at)}</TableCell>
                 <TableCell align="right">
                   <IconButton
-                    onClick={() => handleOpenDialog(name)}
+                    onClick={() => handleOpenDialog(variable.name)}
                     size="small"
                   >
                     <EditIcon />
                   </IconButton>
                   <IconButton
-                    onClick={() => handleDelete(name)}
+                    onClick={() => handleDelete(variable.name)}
                     size="small"
                     color="error"
                   >
@@ -164,15 +187,24 @@ export default function EnvironmentVariables() {
               fullWidth
               label="Name"
               value={newVar.name}
-              onChange={(e) => setNewVar({ ...newVar, name: e.target.value })}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewVar({ ...newVar, name: e.target.value })}
               margin="normal"
               disabled={!!selectedVar}
             />
             <TextField
               fullWidth
+              label="Description (optional)"
+              value={newVar.description}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewVar({ ...newVar, description: e.target.value })}
+              margin="normal"
+              multiline
+              rows={2}
+            />
+            <TextField
+              fullWidth
               label="Value"
               value={newVar.value}
-              onChange={(e) => setNewVar({ ...newVar, value: e.target.value })}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewVar({ ...newVar, value: e.target.value })}
               margin="normal"
               type="password"
             />
