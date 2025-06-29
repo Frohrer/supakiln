@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Box, Grid, Paper, Typography, Button, TextField, IconButton, Switch, FormControlLabel, MenuItem, Divider } from '@mui/material';
-import { Add as AddIcon, Delete as DeleteIcon, PlayArrow as PlayIcon } from '@mui/icons-material';
+import { Box, Grid, Paper, Typography, Button, TextField, IconButton, Switch, FormControlLabel, MenuItem, Divider, Alert, Link } from '@mui/material';
+import { Add as AddIcon, Delete as DeleteIcon, PlayArrow as PlayIcon, Launch as LaunchIcon } from '@mui/icons-material';
 import Editor from '@monaco-editor/react';
 import api from '../config/api';
 
@@ -10,8 +10,180 @@ interface Container {
   created_at: string;
 }
 
+interface WebService {
+  type: string;
+  external_port: number;
+  proxy_url: string;
+}
+
+const appTemplates = {
+  basic: {
+    name: 'Basic Python',
+    packages: [],
+    code: '# Write your Python code here\nprint("Hello, World!")'
+  },
+  streamlit: {
+    name: 'Streamlit App',
+    packages: ['streamlit'],
+    code: `import streamlit as st
+import pandas as pd
+import numpy as np
+
+def main():
+    st.title("My Streamlit App")
+    st.write("Hello from Streamlit!")
+
+    # Add some interactive elements
+    name = st.text_input("Enter your name:")
+    if name:
+        st.write(f"Hello, {name}!")
+
+    if st.button("Click me!"):
+        st.success("Button clicked!")
+
+    # Add some data visualization
+    chart_data = pd.DataFrame(
+        np.random.randn(20, 3),
+        columns=['a', 'b', 'c']
+    )
+
+    st.line_chart(chart_data)
+
+if __name__ == "__main__":
+    main()
+`
+  },
+  fastapi: {
+    name: 'FastAPI App',
+    packages: ['fastapi', 'uvicorn'],
+    code: `from fastapi import FastAPI
+import uvicorn
+
+app = FastAPI(title="My API", description="A simple FastAPI application")
+
+@app.get("/")
+def read_root():
+    return {"message": "Hello World", "status": "running"}
+
+@app.get("/items/{item_id}")
+def read_item(item_id: int, q: str = None):
+    return {"item_id": item_id, "q": q}
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    # This will start the server
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+`
+  },
+  flask: {
+    name: 'Flask App',
+    packages: ['flask'],
+    code: `from flask import Flask, jsonify, render_template_string
+
+app = Flask(__name__)
+
+# Simple HTML template
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>My Flask App</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        .container { max-width: 600px; margin: 0 auto; }
+        h1 { color: #333; }
+        .btn { background: #007bff; color: white; padding: 10px 20px; 
+               text-decoration: none; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to My Flask App!</h1>
+        <p>This is a simple Flask application.</p>
+        <a href="/api/data" class="btn">View API Data</a>
+    </div>
+</body>
+</html>
+'''
+
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/data')
+def get_data():
+    return jsonify({
+        "message": "Hello from Flask!",
+        "data": [1, 2, 3, 4, 5],
+        "status": "success"
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+`
+  },
+  dash: {
+    name: 'Dash App',
+    packages: ['dash', 'plotly'],
+    code: `import dash
+from dash import dcc, html, Input, Output
+import plotly.express as px
+import pandas as pd
+
+# Create sample data
+df = pd.DataFrame({
+    'Fruit': ['Apples', 'Oranges', 'Bananas', 'Grapes'],
+    'Amount': [4, 1, 2, 3],
+    'City': ['SF', 'SF', 'NYC', 'NYC']
+})
+
+# Initialize the Dash app
+app = dash.Dash(__name__)
+
+# Define the layout
+app.layout = html.Div([
+    html.H1("My Dash Application", style={'textAlign': 'center'}),
+    
+    html.Div([
+        html.Label("Select City:"),
+        dcc.Dropdown(
+            id='city-dropdown',
+            options=[{'label': city, 'value': city} for city in df['City'].unique()],
+            value='SF'
+        )
+    ], style={'width': '48%', 'display': 'inline-block'}),
+    
+    dcc.Graph(id='fruit-graph'),
+    
+    html.Div([
+        html.H3("Sample Text"),
+        html.P("This is a sample Dash application with interactive components!")
+    ])
+])
+
+# Callback for updating the graph
+@app.callback(
+    Output('fruit-graph', 'figure'),
+    Input('city-dropdown', 'value')
+)
+def update_graph(selected_city):
+    filtered_df = df[df['City'] == selected_city]
+    fig = px.bar(filtered_df, x='Fruit', y='Amount', 
+                 title=f'Fruit Amount in {selected_city}')
+    return fig
+
+if __name__ == '__main__':
+    app.run_server(host='0.0.0.0', port=8050, debug=True)
+`
+  }
+};
+
 const CodeEditor: React.FC = () => {
-  const [code, setCode] = useState('# Write your Python code here\nprint("Hello, World!")');
+  const [selectedTemplate, setSelectedTemplate] = useState('basic');
+  const [code, setCode] = useState(appTemplates.basic.code);
   const [packages, setPackages] = useState<string[]>(['']);
   const [output, setOutput] = useState<string>('');
   const [selectedContainer, setSelectedContainer] = useState<string>('');
@@ -21,6 +193,7 @@ const CodeEditor: React.FC = () => {
   const [containers, setContainers] = useState<Container[]>([]);
   const [isExecuting, setIsExecuting] = useState(false);
   const [executionTime, setExecutionTime] = useState<number | null>(null);
+  const [webService, setWebService] = useState<WebService | null>(null);
 
   useEffect(() => {
     fetchContainers();
@@ -33,6 +206,14 @@ const CodeEditor: React.FC = () => {
     } catch (error) {
       console.error('Error fetching containers:', error);
     }
+  };
+
+  const handleTemplateChange = (templateKey: string) => {
+    const template = appTemplates[templateKey as keyof typeof appTemplates];
+    setSelectedTemplate(templateKey);
+    setCode(template.code);
+    setPackages(template.packages.length > 0 ? template.packages : ['']);
+    setWebService(null); // Clear any previous web service info
   };
 
   const handleAddPackage = () => {
@@ -54,6 +235,7 @@ const CodeEditor: React.FC = () => {
     setOutput('');
     setIsExecuting(true);
     setExecutionTime(null);
+    setWebService(null);
     const startTime = Date.now();
     
     try {
@@ -80,7 +262,13 @@ const CodeEditor: React.FC = () => {
         const endTime = Date.now();
         const execTime = endTime - startTime;
         setExecutionTime(execTime);
+        
         setOutput(response.data.output || response.data.error || '');
+        
+        // Handle web service response
+        if (response.data.web_service) {
+          setWebService(response.data.web_service);
+        }
       }
     } catch (error) {
       const endTime = Date.now();
@@ -90,6 +278,16 @@ const CodeEditor: React.FC = () => {
     } finally {
       setIsExecuting(false);
     }
+  };
+
+  const getServiceTypeColor = (serviceType: string) => {
+    const colors: { [key: string]: 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info' } = {
+      streamlit: 'error',
+      fastapi: 'success',
+      flask: 'info',
+      dash: 'warning',
+    };
+    return colors[serviceType] || 'primary';
   };
 
   return (
@@ -110,6 +308,21 @@ const CodeEditor: React.FC = () => {
         >
           {isExecuting ? 'Running...' : (isScheduled ? 'Schedule Job' : 'Run')}
         </Button>
+        
+        <TextField
+          select
+          size="small"
+          label="App Template"
+          value={selectedTemplate}
+          onChange={(e) => handleTemplateChange(e.target.value)}
+          sx={{ minWidth: 200 }}
+        >
+          {Object.entries(appTemplates).map(([key, template]) => (
+            <MenuItem key={key} value={key}>
+              {template.name}
+            </MenuItem>
+          ))}
+        </TextField>
         
         <TextField
           select
@@ -221,6 +434,41 @@ const CodeEditor: React.FC = () => {
               </Box>
             )}
           </Paper>
+
+          {/* Web Service Panel */}
+          {webService && (
+            <Paper sx={{ p: 2 }}>
+              <Typography variant="h6" gutterBottom>
+                🚀 Web Service Running
+              </Typography>
+              <Alert severity="success" sx={{ mb: 2 }}>
+                Your {webService.type} app is now accessible!
+              </Alert>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                <Typography variant="body2" fontWeight="bold">
+                  Service URL:
+                </Typography>
+                <Link
+                  href={webService.proxy_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  color="primary"
+                  sx={{ textDecoration: 'none' }}
+                >
+                  {webService.proxy_url}
+                </Link>
+                <IconButton
+                  size="small"
+                  onClick={() => window.open(webService.proxy_url, '_blank')}
+                >
+                  <LaunchIcon fontSize="small" />
+                </IconButton>
+              </Box>
+              <Typography variant="caption" color="text.secondary">
+                Port: {webService.external_port} | Type: {webService.type}
+              </Typography>
+            </Paper>
+          )}
 
           {/* Output panel */}
           <Paper sx={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: '300px' }}>

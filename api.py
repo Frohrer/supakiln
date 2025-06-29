@@ -7,7 +7,7 @@ import uvicorn
 import os
 
 # Import all routers
-from routers import containers, execution, jobs, webhooks, services, environment, logs, webhook_execution
+from routers import containers, execution, jobs, webhooks, services, environment, logs, webhook_execution, proxy
 
 # Import services and models for startup
 from services.service_manager import service_manager
@@ -52,6 +52,7 @@ app.include_router(services.router)
 app.include_router(environment.router)
 app.include_router(logs.router)
 app.include_router(webhook_execution.router)
+app.include_router(proxy.router)
 
 async def startup_event():
     """Initialize services on startup."""

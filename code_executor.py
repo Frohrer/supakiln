@@ -6,6 +6,7 @@ import hashlib
 import threading
 import base64
 import docker
+import random
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
@@ -13,6 +14,7 @@ class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
         self.image_name = image_name
         self.containers: Dict[str, str] = {}  # package_hash -> container_id
+        self.web_service_containers: Dict[str, Dict] = {}  # container_id -> service_info
         self._base_image_ready = False
         
     def _run_docker_command(self, command: List[str], timeout: int = 30) -> Tuple[bool, str, Optional[str]]:
@@ -69,6 +71,60 @@ class CodeExecutor:
         package_str = "-".join(sorted_packages)
         hash_obj = hashlib.md5(package_str.encode())
         return hash_obj.hexdigest()[:12]
+    
+    def _allocate_port(self) -> int:
+        """Allocate a random available port between 9000-9999."""
+        for _ in range(100):  # Try up to 100 times
+            port = random.randint(9000, 9999)
+            try:
+                import socket
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(('localhost', port))
+                    return port
+            except OSError:
+                continue
+        raise Exception("No available ports in range 9000-9999")
+    
+    def _detect_web_service(self, code: str, packages: List[str]) -> Optional[Dict]:
+        """Detect if code contains a web service and return service info with dynamic port."""
+        code_lower = code.lower()
+        
+        # Allocate a dynamic internal port for this service
+        internal_port = self._allocate_port()
+        
+        # Streamlit detection
+        if 'streamlit' in packages or 'streamlit' in code_lower or 'st.' in code:
+            return {
+                'type': 'streamlit',
+                'internal_port': internal_port,
+                'start_command': f'cd /tmp && streamlit run app.py --server.address=0.0.0.0 --server.port={internal_port} --server.headless=true --browser.gatherUsageStats=false'
+            }
+        
+        # FastAPI detection
+        if 'fastapi' in packages or 'uvicorn' in packages or ('fastapi' in code_lower and 'uvicorn' in code_lower):
+            return {
+                'type': 'fastapi', 
+                'internal_port': internal_port,
+                'start_command': f'cd /tmp && python -c "import sys; sys.path.insert(0, \\"/tmp\\"); from app import app; import uvicorn; uvicorn.run(app, host=\\"0.0.0.0\\", port={internal_port})"'
+            }
+        
+        # Flask detection
+        if 'flask' in packages or 'flask' in code_lower:
+            return {
+                'type': 'flask',
+                'internal_port': internal_port, 
+                'start_command': f'cd /tmp && python -c "import sys; sys.path.insert(0, \\"/tmp\\"); from app import app; app.run(host=\\"0.0.0.0\\", port={internal_port}, debug=True)"'
+            }
+        
+        # Dash detection
+        if 'dash' in packages or ('dash' in code_lower and 'plotly' in packages):
+            return {
+                'type': 'dash',
+                'internal_port': internal_port,
+                'start_command': f'cd /tmp && python -c "import sys; sys.path.insert(0, \\"/tmp\\"); from app import app; app.run_server(host=\\"0.0.0.0\\", port={internal_port}, debug=True)"'
+            }
+        
+        return None
     
     def _build_image(self, packages: List[str]) -> str:
         """Build a Docker image with the specified packages."""
@@ -165,39 +221,220 @@ USER codeuser
         """
         package_hash = self._get_package_hash(packages)
         
-        # Get or create container
-        if package_hash not in self.containers:
+        # Detect if this is a web service
+        web_service = self._detect_web_service(code, packages)
+        
+        # For web services, always create a new container
+        # For regular code, use package hash to potentially reuse containers
+        if web_service:
+            # Create a unique container for each web service
             image_tag = self._build_image(packages)
+            
+            # Allocate external port
+            external_port = self._allocate_port()
+            port_mapping = f"{external_port}:{web_service['internal_port']}"
+            
+            # Use bridge network since we're in Docker-in-Docker sidecar
+            network_options = ["--network", "bridge"]
+            print("✅ Using bridge network (Docker-in-Docker environment)")
+            
+            # Note: Web services will be accessible via Docker host port mapping
+            
             success, output, error = self._run_docker_command([
                 "docker", "run",
                 "-d",
+                "-p", port_mapping,
                 "--memory", "512m",
-                "--cpus", "0.5",
+                "--cpus", "0.5"
+            ] + network_options + [
                 image_tag,
                 "tail", "-f", "/dev/null"
             ])
+            
             if not success:
                 return {
                     "success": False,
                     "output": None,
                     "error": f"Failed to create container: {error}"
                 }
+            
             container_id = output.strip()
-            self.containers[package_hash] = container_id
-        
-        container_id = self.containers[package_hash]
-        
-        # Encode the code in base64 and execute directly
-        encoded_code = base64.b64encode(code.encode()).decode()
-        exec_command = f"echo '{encoded_code}' | base64 -d | python3"
-        success, output, error = self._execute_with_timeout(container_id, exec_command, timeout)
-        
-        return {
-            "success": success,
-            "output": output,
-            "error": error,
-            "container_id": container_id
-        }
+            
+            # Store web service info
+            self.web_service_containers[container_id] = {
+                'type': web_service['type'],
+                'internal_port': web_service['internal_port'],
+                'external_port': external_port,
+                'start_command': web_service['start_command']
+            }
+            
+            # For web services, save code to file and start the service
+            encoded_code = base64.b64encode(code.encode()).decode()
+            
+            # Save code to app.py in container
+            save_command = f"echo '{encoded_code}' | base64 -d > /tmp/app.py"
+            success, output, error = self._execute_with_timeout(container_id, save_command, 10)
+            
+            if not success:
+                return {
+                    "success": False,
+                    "output": None,
+                    "error": f"Failed to save code: {error}"
+                }
+            
+            # Start the web service (non-blocking)
+            service_info = self.web_service_containers[container_id]
+            
+            print(f"🚀 Starting {service_info['type']} service in container {container_id[:8]}")
+            print(f"📝 Command: {service_info['start_command']}")
+            print(f"🌐 Internal port: {service_info['internal_port']} -> External port: {service_info['external_port']}")
+            
+            # First, validate the app.py file
+            validate_command = "python -m py_compile /tmp/app.py"
+            validate_success, validate_output, validate_error = self._execute_with_timeout(container_id, validate_command, 5)
+            
+            if not validate_success:
+                print(f"❌ App validation failed: {validate_error}")
+            else:
+                print(f"✅ App validation passed")
+            
+            # Check if required packages are available
+            if service_info['type'] == 'streamlit':
+                pkg_check = "python -c 'import streamlit; print(f\"Streamlit version: {streamlit.__version__}\")'"
+            elif service_info['type'] == 'flask':
+                pkg_check = "python -c 'import flask; print(f\"Flask version: {flask.__version__}\")'"
+            elif service_info['type'] == 'fastapi':
+                pkg_check = "python -c 'import fastapi, uvicorn; print(f\"FastAPI: {fastapi.__version__}, Uvicorn: {uvicorn.__version__}\")'"
+            elif service_info['type'] == 'dash':
+                pkg_check = "python -c 'import dash; print(f\"Dash version: {dash.__version__}\")'"
+            else:
+                pkg_check = "echo 'Unknown service type'"
+                
+            pkg_success, pkg_output, pkg_error = self._execute_with_timeout(container_id, pkg_check, 5)
+            print(f"📦 Package check: {pkg_output if pkg_success else pkg_error}")
+            
+            # Start the service in background using Docker exec -d (detached)
+            service_start_script = f'''#!/bin/bash
+cd /tmp
+export PYTHONPATH=/tmp:$PYTHONPATH
+{service_info['start_command']} > /tmp/service.log 2>&1
+'''
+            
+            # Create the startup script
+            script_command = f"echo '{base64.b64encode(service_start_script.encode()).decode()}' | base64 -d > /tmp/start_service.sh && chmod +x /tmp/start_service.sh"
+            success, output, error = self._execute_with_timeout(container_id, script_command, 10)
+            
+            if not success:
+                print(f"❌ Failed to create startup script: {error}")
+            else:
+                print(f"✅ Startup script created")
+            
+            # Start the service using Docker exec -d (detached mode)
+            try:
+                env = os.environ.copy()
+                result = subprocess.run([
+                    "docker", "exec", "-d", container_id, "/tmp/start_service.sh"
+                ], capture_output=True, text=True, timeout=10, env=env)
+                
+                if result.returncode == 0:
+                    print(f"✅ Service started in detached mode")
+                    success = True
+                else:
+                    print(f"❌ Failed to start service: {result.stderr}")
+                    success = False
+                    error = result.stderr
+            except Exception as e:
+                print(f"❌ Exception starting service: {e}")
+                success = False
+                error = str(e)
+            
+            # Give the service more time to start fully
+            print("⏳ Waiting for service to initialize...")
+            time.sleep(8)
+            
+            # Check if service started successfully by looking at the log
+            log_check_command = "tail -n 30 /tmp/service.log 2>/dev/null || echo 'Log not found'"
+            log_success, log_output, _ = self._execute_with_timeout(container_id, log_check_command, 5)
+            
+            # Check if service is actually running by checking the process
+            process_check_command = f"ps aux | grep -E '(streamlit|uvicorn|flask|python.*start_service)' | grep -v grep || echo 'No service process found'"
+            process_success, process_output, _ = self._execute_with_timeout(container_id, process_check_command, 5)
+            
+            # Check if the service port is listening
+            port_check_command = f"netstat -tlnp | grep :{service_info['internal_port']} || ss -tlnp | grep :{service_info['internal_port']} || echo 'Port not listening'"
+            port_success, port_output, _ = self._execute_with_timeout(container_id, port_check_command, 5)
+            
+            print(f"🔍 Service process check: {process_output}")
+            print(f"🔍 Port check: {port_output}")
+            print(f"🔍 Service logs: {log_output}")
+            
+            # Get backend URL for proxy
+            backend_url = os.environ.get('VITE_API_URL', os.environ.get('BACKEND_URL', 'http://localhost:8000'))
+            proxy_url = f"{backend_url}/proxy/{container_id[:8]}"
+            
+            # Check if service startup was successful
+            if not success:
+                return {
+                    "success": False,
+                    "output": None,
+                    "error": f"Failed to start {service_info['type']} service: {error}",
+                    "container_id": container_id
+                }
+            
+            # Create success message with service logs
+            output_message = f"🚀 {service_info['type'].title()} service started!\n\n📍 Access your app at: {proxy_url}\n\nService is running on port {service_info['external_port']} (internal: {service_info['internal_port']})"
+            
+            if log_success and log_output and 'Log not found' not in log_output:
+                output_message += f"\n\n--- Service Startup Log ---\n{log_output}"
+            
+            return {
+                "success": True,
+                "output": output_message,
+                "error": None,
+                "container_id": container_id,
+                "web_service": {
+                    "type": service_info['type'],
+                    "external_port": service_info['external_port'],
+                    "proxy_url": proxy_url
+                }
+            }
+        else:
+            # Regular code execution - use package hash to potentially reuse containers
+            if package_hash not in self.containers:
+                image_tag = self._build_image(packages)
+                
+                # Regular container for non-web services
+                success, output, error = self._run_docker_command([
+                    "docker", "run",
+                    "-d",
+                    "--memory", "512m",
+                    "--cpus", "0.5",
+                    "--network", "bridge",  # Use bridge network for regular containers
+                    image_tag,
+                    "tail", "-f", "/dev/null"
+                ])
+                if not success:
+                    return {
+                        "success": False,
+                        "output": None,
+                        "error": f"Failed to create container: {error}"
+                    }
+                container_id = output.strip()
+                self.containers[package_hash] = container_id
+            
+            container_id = self.containers[package_hash]
+            
+            # Regular code execution
+            encoded_code = base64.b64encode(code.encode()).decode()
+            exec_command = f"echo '{encoded_code}' | base64 -d | python3"
+            success, output, error = self._execute_with_timeout(container_id, exec_command, timeout)
+            
+            return {
+                "success": success,
+                "output": output,
+                "error": error,
+                "container_id": container_id
+            }
     
     def cleanup(self):
         """Clean up all containers."""
@@ -208,6 +445,7 @@ USER codeuser
             except Exception:
                 pass
         self.containers.clear()
+        self.web_service_containers.clear()
 
 if __name__ == "__main__":
     # Example usage

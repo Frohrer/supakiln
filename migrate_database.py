@@ -129,6 +129,27 @@ def migrate_database():
             cursor.execute("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '5')")
             current_version = 5
         
+        # Migration 6: Add exposed_ports table
+        if current_version < 6:
+            print("Applying migration 6: Creating exposed_ports table...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS exposed_ports (
+                    id INTEGER PRIMARY KEY,
+                    container_id VARCHAR(100) NOT NULL,
+                    internal_port INTEGER NOT NULL,
+                    external_port INTEGER NOT NULL,
+                    service_name VARCHAR(100),
+                    service_type VARCHAR(50),
+                    proxy_path VARCHAR(200) UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_accessed TIMESTAMP,
+                    is_active INTEGER DEFAULT 1,
+                    description TEXT
+                )
+            """)
+            cursor.execute("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '6')")
+            current_version = 6
+        
         conn.commit()
         print(f"Database migration completed. Current version: {current_version}")
         

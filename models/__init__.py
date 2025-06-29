@@ -6,6 +6,7 @@ from db_models import (
     WebhookJob,
     PersistentService, 
     ExecutionLog,
+    ExposedPort,
     SessionLocal,
     Base,
     get_db
@@ -17,6 +18,7 @@ __all__ = [
     "WebhookJob",
     "PersistentService",
     "ExecutionLog", 
+    "ExposedPort",
     "SessionLocal",
     "Base",
     "get_db"
