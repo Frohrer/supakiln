@@ -8,4 +8,5 @@ aiosqlite
 apscheduler==3.10.4
 python-dotenv==1.0.0
 cryptography==41.0.5
-httpx==0.25.2 
+httpx==0.25.2
+websockets==12.0 

@@ -97,7 +97,8 @@ class CodeExecutor:
             return {
                 'type': 'streamlit',
                 'internal_port': internal_port,
-                'start_command': f'cd /tmp && streamlit run app.py --server.address=0.0.0.0 --server.port={internal_port} --server.headless=true --browser.gatherUsageStats=false'
+                'start_command': f'cd /tmp && streamlit run app.py --server.address=0.0.0.0 --server.port={internal_port}',
+                'needs_proxy_path': True  # Flag to indicate this service needs proxy path configuration
             }
         
         # FastAPI detection
@@ -286,7 +287,14 @@ USER codeuser
             service_info = self.web_service_containers[container_id]
             
             print(f"🚀 Starting {service_info['type']} service in container {container_id[:8]}")
-            print(f"📝 Command: {service_info['start_command']}")
+            if service_info['type'] == 'streamlit':
+                container_short_id = container_id[:8]
+                proxy_path = f"/proxy/{container_short_id}"
+                enhanced_command = f'streamlit run app.py --server.address=0.0.0.0 --server.port={service_info["internal_port"]} --server.baseUrlPath="{proxy_path}"'
+                print(f"📝 Enhanced Command: {enhanced_command}")
+                print(f"🛣️  Proxy Path: {proxy_path}")
+            else:
+                print(f"📝 Command: {service_info['start_command']}")
             print(f"🌐 Internal port: {service_info['internal_port']} -> External port: {service_info['external_port']}")
             
             # First, validate the app.py file
@@ -314,7 +322,51 @@ USER codeuser
             print(f"📦 Package check: {pkg_output if pkg_success else pkg_error}")
             
             # Start the service in background using Docker exec -d (detached)
-            service_start_script = f'''#!/bin/bash
+            if service_info['type'] == 'streamlit':
+                # Create Streamlit config with proper baseUrlPath for proxy routing
+                container_short_id = container_id[:8]  # Use first 8 chars for proxy path
+                proxy_path = f"/proxy/{container_short_id}"
+                
+                streamlit_config = f'''
+[server]
+enableCORS = false
+enableXsrfProtection = false
+maxUploadSize = 200
+headless = true
+enableStaticServing = true
+enableWebsocketCompression = false
+port = {service_info["internal_port"]}
+address = "0.0.0.0"
+
+[browser]
+gatherUsageStats = false
+
+[global]
+unitTest = false
+
+[client]
+toolbarMode = "minimal"
+
+[logger]
+level = "info"
+'''
+                config_script = f"echo '{base64.b64encode(streamlit_config.encode()).decode()}' | base64 -d > /tmp/.streamlit/config.toml"
+                
+                # Build enhanced Streamlit command with baseUrlPath argument for dual configuration approach
+                enhanced_streamlit_command = f'cd /tmp && streamlit run app.py --server.address=0.0.0.0 --server.port={service_info["internal_port"]} --server.baseUrlPath="{proxy_path}"'
+                
+                service_start_script = f'''#!/bin/bash
+cd /tmp
+mkdir -p .streamlit
+{config_script}
+export PYTHONPATH=/tmp:$PYTHONPATH
+export STREAMLIT_SERVER_BASE_URL_PATH="{proxy_path}"
+export STREAMLIT_SERVER_ENABLE_STATIC_SERVING=true
+export STREAMLIT_SERVER_ENABLE_WEBSOCKET_COMPRESSION=false
+{enhanced_streamlit_command} > /tmp/service.log 2>&1
+'''
+            else:
+                service_start_script = f'''#!/bin/bash
 cd /tmp
 export PYTHONPATH=/tmp:$PYTHONPATH
 {service_info['start_command']} > /tmp/service.log 2>&1

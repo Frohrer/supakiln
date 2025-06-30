@@ -11,12 +11,12 @@ from sqlalchemy import text
 def migrate_database():
     db_path = "code_executor.db"
     
-    # Create backup
-    if os.path.exists(db_path):
-        backup_path = f"{db_path}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        import shutil
-        shutil.copy2(db_path, backup_path)
-        print(f"Database backed up to: {backup_path}")
+    # TODO: Uncomment this when we have a way to backup the database without creation a million backups
+    # if os.path.exists(db_path):
+    #     backup_path = f"{db_path}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    #     import shutil
+    #     shutil.copy2(db_path, backup_path)
+    #     print(f"Database backed up to: {backup_path}")
     
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
