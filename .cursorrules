@@ -1,0 +1,31 @@
+# Cursor Rules for Supakiln Project
+
+## Documentation Guidelines
+- **Do NOT create .md documentation files** unless explicitly requested by the user
+- Focus on code implementation rather than documentation
+- Keep comments in code concise and functional
+- Only create README updates if specifically asked
+
+## Database Guidelines  
+- **Do NOT create database migrations** unless explicitly requested
+- The project is fine with losing data during development
+- Make direct changes to db_models.py when updating schemas
+- Only create migration scripts when specifically asked for production deployment
+
+## Code Preferences
+- Prioritize working code over comprehensive documentation
+- Use inline comments for complex logic but avoid over-documenting
+- Focus on implementation first, documentation second
+- Keep responses concise and action-focused
+
+## File Creation Rules
+- Avoid creating auxiliary files unless necessary for functionality
+- Don't create example/test files unless requested
+- Focus on modifying existing files rather than creating new ones
+- Only create new files when they're essential for the requested feature
+
+## General Approach
+- Be direct and implementation-focused
+- Ask for clarification if unsure about creating additional files
+- Prioritize the user's immediate needs over comprehensive solutions
+- Keep the codebase lean and focused 

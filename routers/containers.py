@@ -4,11 +4,9 @@ import docker
 from models.schemas import PackageInstallRequest, ContainerResponse
 from services.docker_client import docker_client
 from code_executor import CodeExecutor
+from services.code_executor_service import get_code_executor
 
 router = APIRouter(prefix="/containers", tags=["containers"])
-
-# Initialize executor
-executor = CodeExecutor()
 
 # Store container names
 container_names = {}  # container_id -> name
@@ -24,11 +22,11 @@ async def create_container(request: PackageInstallRequest):
         if request.name in container_names.values():
             raise HTTPException(status_code=400, detail="Container name already exists")
         
-        package_hash = executor._get_package_hash(request.packages)
-        image_tag = executor._build_image(request.packages)
+        package_hash = get_code_executor()._get_package_hash(request.packages)
+        image_tag = get_code_executor()._build_image(request.packages)
         
         # Create container if it doesn't exist
-        if package_hash not in executor.containers:
+        if package_hash not in get_code_executor().containers:
             container = docker_client.containers.run(
                 image_tag,
                 detach=True,
@@ -37,9 +35,9 @@ async def create_container(request: PackageInstallRequest):
                 cpu_period=100000,
                 cpu_quota=50000
             )
-            executor.containers[package_hash] = container.id
+            get_code_executor().containers[package_hash] = container.id
         
-        container_id = executor.containers[package_hash]
+        container_id = get_code_executor().containers[package_hash]
         container_names[container_id] = request.name
         
         return ContainerResponse(
@@ -62,7 +60,7 @@ async def list_containers():
     List all active containers and their installed packages.
     """
     containers = []
-    for package_hash, container_id in executor.containers.items():
+    for package_hash, container_id in get_code_executor().containers.items():
         try:
             container = docker_client.containers.get(container_id)
             # Extract packages from image tag
@@ -84,7 +82,7 @@ async def get_container(container_id: str):
     Get details of a specific container including its code.
     """
     try:
-        if container_id not in executor.containers.values():
+        if container_id not in get_code_executor().containers.values():
             raise HTTPException(status_code=404, detail="Container not found")
         
         container = docker_client.containers.get(container_id)
@@ -116,14 +114,14 @@ async def delete_container(container_id: str):
     Delete a specific container.
     """
     try:
-        if container_id in executor.containers.values():
+        if container_id in get_code_executor().containers.values():
             container = docker_client.containers.get(container_id)
             container.stop()
             container.remove()
             # Remove from our tracking
-            for package_hash, cid in list(executor.containers.items()):
+            for package_hash, cid in list(get_code_executor().containers.items()):
                 if cid == container_id:
-                    del executor.containers[package_hash]
+                    del get_code_executor().containers[package_hash]
             # Remove from names
             if container_id in container_names:
                 del container_names[container_id]
@@ -138,7 +136,7 @@ async def cleanup_all():
     Clean up all containers.
     """
     try:
-        executor.cleanup()
+        get_code_executor().cleanup()
         container_names.clear()
         return {"message": "All containers cleaned up successfully"}
     except Exception as e:
