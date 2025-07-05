@@ -7,6 +7,7 @@ import threading
 import base64
 import docker
 import random
+import resource
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
@@ -122,7 +123,7 @@ class CodeExecutor:
             return {
                 'type': 'dash',
                 'internal_port': internal_port,
-                'start_command': f'cd /tmp && python -c "import sys; sys.path.insert(0, \\"/tmp\\"); from app import app; app.run_server(host=\\"0.0.0.0\\", port={internal_port}, debug=True)"'
+                'start_command': f'cd /tmp && python -c "import sys; sys.path.insert(0, \\"/tmp\\"); from app import app; app.run(host=\\"0.0.0.0\\", port={internal_port}, debug=True)"'
             }
         
         return None
@@ -207,6 +208,157 @@ USER codeuser
             return False, None, f"Execution timed out after {timeout} seconds"
         except Exception as e:
             return False, None, str(e)
+    
+    def _collect_container_metrics(self, container_id: str) -> Dict:
+        """Collect detailed resource metrics from a container."""
+        metrics = {}
+        
+        try:
+            # Get container stats using Docker stats API
+            env = os.environ.copy()
+            stats_result = subprocess.run(
+                ["docker", "stats", container_id, "--no-stream", "--format", "json"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env
+            )
+            
+            if stats_result.returncode == 0 and stats_result.stdout.strip():
+                stats_data = json.loads(stats_result.stdout.strip())
+                
+                # Parse CPU percentage
+                cpu_percent_str = stats_data.get("CPUPerc", "0%").rstrip('%')
+                metrics["cpu_percent"] = float(cpu_percent_str) if cpu_percent_str != "0" else 0.0
+                
+                # Parse memory usage
+                mem_usage_str = stats_data.get("MemUsage", "0B / 0B")
+                if "/" in mem_usage_str:
+                    usage_str, limit_str = mem_usage_str.split(" / ")
+                    metrics["memory_usage"] = self._parse_memory_string(usage_str)
+                    metrics["memory_limit"] = self._parse_memory_string(limit_str)
+                    
+                    # Calculate memory percentage
+                    if metrics["memory_limit"] > 0:
+                        metrics["memory_percent"] = (metrics["memory_usage"] / metrics["memory_limit"]) * 100
+                    else:
+                        metrics["memory_percent"] = 0.0
+                
+                # Parse Block I/O
+                block_io_str = stats_data.get("BlockIO", "0B / 0B")
+                if "/" in block_io_str:
+                    read_str, write_str = block_io_str.split(" / ")
+                    metrics["block_io_read"] = self._parse_memory_string(read_str)
+                    metrics["block_io_write"] = self._parse_memory_string(write_str)
+                
+                # Parse Network I/O
+                net_io_str = stats_data.get("NetIO", "0B / 0B")
+                if "/" in net_io_str:
+                    rx_str, tx_str = net_io_str.split(" / ")
+                    metrics["network_io_rx"] = self._parse_memory_string(rx_str)
+                    metrics["network_io_tx"] = self._parse_memory_string(tx_str)
+                
+                # Parse PIDs
+                pids_str = stats_data.get("PIDs", "0")
+                metrics["pids_count"] = int(pids_str) if pids_str.isdigit() else 0
+                
+        except Exception as e:
+            print(f"Warning: Could not collect container stats: {e}")
+        
+        # Try to get CPU time from cgroup files
+        try:
+            # Get CPU time from cgroup
+            cpu_time_result = subprocess.run(
+                ["docker", "exec", container_id, "cat", "/sys/fs/cgroup/cpu.stat"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=os.environ.copy()
+            )
+            
+            if cpu_time_result.returncode == 0:
+                cpu_stats = cpu_time_result.stdout.strip()
+                for line in cpu_stats.split('\n'):
+                    if line.startswith('usage_usec'):
+                        total_cpu_time = int(line.split()[1]) / 1000000.0  # Convert microseconds to seconds
+                        metrics["cpu_total_time"] = total_cpu_time
+                    elif line.startswith('user_usec'):
+                        user_time = int(line.split()[1]) / 1000000.0
+                        metrics["cpu_user_time"] = user_time
+                    elif line.startswith('system_usec'):
+                        system_time = int(line.split()[1]) / 1000000.0
+                        metrics["cpu_system_time"] = system_time
+        except Exception as e:
+            print(f"Warning: Could not collect CPU time from cgroup: {e}")
+            
+        # Try to get memory peak from cgroup
+        try:
+            memory_peak_result = subprocess.run(
+                ["docker", "exec", container_id, "cat", "/sys/fs/cgroup/memory.peak"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=os.environ.copy()
+            )
+            
+            if memory_peak_result.returncode == 0:
+                memory_peak = int(memory_peak_result.stdout.strip())
+                metrics["memory_peak"] = memory_peak
+        except Exception as e:
+            # Try alternative path for cgroup v1
+            try:
+                memory_peak_result = subprocess.run(
+                    ["docker", "exec", container_id, "cat", "/sys/fs/cgroup/memory/memory.max_usage_in_bytes"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env=os.environ.copy()
+                )
+                
+                if memory_peak_result.returncode == 0:
+                    memory_peak = int(memory_peak_result.stdout.strip())
+                    metrics["memory_peak"] = memory_peak
+            except Exception:
+                print(f"Warning: Could not collect peak memory usage: {e}")
+        
+        return metrics
+    
+    def _parse_memory_string(self, mem_str: str) -> int:
+        """Parse memory string like '1.5MiB' to bytes."""
+        if not mem_str or mem_str == "0B":
+            return 0
+            
+        # Remove whitespace
+        mem_str = mem_str.strip()
+        
+        # Handle different units
+        units = {
+            'B': 1,
+            'KiB': 1024,
+            'MiB': 1024 * 1024,
+            'GiB': 1024 * 1024 * 1024,
+            'KB': 1000,
+            'MB': 1000 * 1000,
+            'GB': 1000 * 1000 * 1000,
+            'kB': 1000,
+            'mB': 1000 * 1000,
+            'gB': 1000 * 1000 * 1000,
+        }
+        
+        for unit, multiplier in units.items():
+            if mem_str.endswith(unit):
+                value_str = mem_str[:-len(unit)]
+                try:
+                    value = float(value_str)
+                    return int(value * multiplier)
+                except ValueError:
+                    break
+        
+        # If no unit found, assume bytes
+        try:
+            return int(float(mem_str))
+        except ValueError:
+            return 0
     
     def execute_code(self, code: str, packages: List[str], timeout: int = 30) -> Dict:
         """
@@ -323,9 +475,9 @@ USER codeuser
             
             # Start the service in background using Docker exec -d (detached)
             if service_info['type'] == 'streamlit':
-                # Create Streamlit config with proper baseUrlPath for proxy routing
-                container_short_id = container_id[:8]  # Use first 8 chars for proxy path
-                proxy_path = f"/proxy/{container_short_id}"
+                # Create Streamlit config without baseUrlPath - let it serve at root level
+                # We'll handle all path rewriting in the proxy layer
+                container_short_id = container_id[:8]
                 
                 streamlit_config = f'''
 [server]
@@ -352,18 +504,89 @@ level = "info"
 '''
                 config_script = f"echo '{base64.b64encode(streamlit_config.encode()).decode()}' | base64 -d > /tmp/.streamlit/config.toml"
                 
-                # Build enhanced Streamlit command with baseUrlPath argument for dual configuration approach
-                enhanced_streamlit_command = f'cd /tmp && streamlit run app.py --server.address=0.0.0.0 --server.port={service_info["internal_port"]} --server.baseUrlPath="{proxy_path}"'
+                # Run Streamlit without baseUrlPath - serve at root level
+                basic_streamlit_command = f'cd /tmp && streamlit run app.py --server.address=0.0.0.0 --server.port={service_info["internal_port"]}'
                 
                 service_start_script = f'''#!/bin/bash
 cd /tmp
 mkdir -p .streamlit
 {config_script}
 export PYTHONPATH=/tmp:$PYTHONPATH
-export STREAMLIT_SERVER_BASE_URL_PATH="{proxy_path}"
 export STREAMLIT_SERVER_ENABLE_STATIC_SERVING=true
 export STREAMLIT_SERVER_ENABLE_WEBSOCKET_COMPRESSION=false
-{enhanced_streamlit_command} > /tmp/service.log 2>&1
+{basic_streamlit_command} > /tmp/service.log 2>&1
+'''
+            elif service_info['type'] == 'dash':
+                # For Dash, we need to modify the app creation to include url_base_pathname
+                container_short_id = container_id[:8]
+                proxy_path = f"/proxy/{container_short_id}/"
+                
+                # Create a script that modifies the original app.py to include proxy configuration
+                dash_patcher = '''#!/usr/bin/env python
+import sys
+import re
+
+# Read the original app.py
+with open('/tmp/app.py', 'r') as f:
+    original_code = f.read()
+
+proxy_path = "''' + proxy_path + '''"
+proxy_params = 'url_base_pathname="' + proxy_path + '"'
+
+# Simple replacement approach
+modified_code = original_code
+
+# Replace dash.Dash(...) patterns
+patterns = [
+    (r'app\\s*=\\s*dash\\.Dash\\s*\\(\\s*\\)', 'app = dash.Dash(' + proxy_params + ')'),
+    (r'app\\s*=\\s*dash\\.Dash\\s*\\(([^)]+)\\)', lambda m: 'app = dash.Dash(' + m.group(1).rstrip(', ') + ', ' + proxy_params + ')'),
+    (r'app\\s*=\\s*Dash\\s*\\(\\s*\\)', 'app = Dash(' + proxy_params + ')'),
+    (r'app\\s*=\\s*Dash\\s*\\(([^)]+)\\)', lambda m: 'app = Dash(' + m.group(1).rstrip(', ') + ', ' + proxy_params + ')')
+]
+
+for pattern, replacement in patterns:
+    if callable(replacement):
+        modified_code = re.sub(pattern, replacement, modified_code)
+    else:
+        modified_code = re.sub(pattern, replacement, modified_code)
+
+# Also fix the app.run() call to use the correct port
+internal_port = ''' + str(service_info["internal_port"]) + '''
+
+# First, check if there's already a port argument and replace it
+if re.search(r'app\\.run\\s*\\([^)]*port\\s*=\\s*\\d+', modified_code):
+    # Replace existing port argument
+    modified_code = re.sub(r'(app\\.run\\s*\\([^)]*)port\\s*=\\s*\\d+([^)]*\\))', 
+                          lambda m: m.group(1) + 'port=' + str(internal_port) + m.group(2), 
+                          modified_code)
+else:
+    # Add port argument if it doesn't exist
+    modified_code = re.sub(r'app\\.run\\s*\\(([^)]*)\\)', 
+                          lambda m: 'app.run(' + (m.group(1).rstrip(', ') + ', ' if m.group(1).strip() else '') + 'port=' + str(internal_port) + ')', 
+                          modified_code)
+
+# Write the modified code
+with open('/tmp/app_proxy.py', 'w') as f:
+    f.write(modified_code)
+
+print("✅ Modified Dash app for proxy usage")
+print("✅ Proxy path: " + proxy_path)
+'''
+                
+                patcher_script = f"echo '{base64.b64encode(dash_patcher.encode()).decode()}' | base64 -d > /tmp/patch_app.py"
+                
+                service_start_script = f'''#!/bin/bash
+cd /tmp
+export PYTHONPATH=/tmp:$PYTHONPATH
+{patcher_script}
+python /tmp/patch_app.py
+if [ -f /tmp/app_proxy.py ]; then
+    echo "🚀 Starting patched Dash app..."
+    python -c "import sys; sys.path.insert(0, '/tmp'); exec(open('/tmp/app_proxy.py').read())" > /tmp/service.log 2>&1
+else
+    echo "❌ Failed to create patched app, using original..."
+    python -c "import sys; sys.path.insert(0, '/tmp'); from app import app; app.run(host='0.0.0.0', port={service_info["internal_port"]}, debug=True)" > /tmp/service.log 2>&1
+fi
 '''
             else:
                 service_start_script = f'''#!/bin/bash
@@ -476,17 +699,69 @@ export PYTHONPATH=/tmp:$PYTHONPATH
             
             container_id = self.containers[package_hash]
             
-            # Regular code execution
+            # Regular code execution with metrics collection
             encoded_code = base64.b64encode(code.encode()).decode()
             exec_command = f"echo '{encoded_code}' | base64 -d | python3"
-            success, output, error = self._execute_with_timeout(container_id, exec_command, timeout)
             
-            return {
+            # Get initial metrics before execution
+            initial_metrics = self._collect_container_metrics(container_id)
+            
+            # Execute the code
+            execution_start_time = time.time()
+            success, output, error = self._execute_with_timeout(container_id, exec_command, timeout)
+            execution_time = time.time() - execution_start_time
+            
+            # Get final metrics after execution
+            final_metrics = self._collect_container_metrics(container_id)
+            
+            # Calculate differential metrics (execution-specific)
+            execution_metrics = {}
+            for key in ["cpu_user_time", "cpu_system_time", "block_io_read", "block_io_write", "network_io_rx", "network_io_tx"]:
+                if key in final_metrics and key in initial_metrics:
+                    execution_metrics[key] = final_metrics[key] - initial_metrics[key]
+                elif key in final_metrics:
+                    execution_metrics[key] = final_metrics[key]
+            
+            # Use final metrics for current values
+            for key in ["cpu_percent", "memory_usage", "memory_peak", "memory_percent", "memory_limit", "pids_count"]:
+                if key in final_metrics:
+                    execution_metrics[key] = final_metrics[key]
+            
+            # Try to get the exit code from the last command
+            exit_code = None
+            try:
+                exit_code_result = subprocess.run(
+                    ["docker", "exec", container_id, "echo", "$?"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env=os.environ.copy()
+                )
+                if exit_code_result.returncode == 0:
+                    try:
+                        exit_code = int(exit_code_result.stdout.strip())
+                    except ValueError:
+                        pass
+            except Exception:
+                pass
+            
+            # If we couldn't get the exit code, infer it from success
+            if exit_code is None:
+                exit_code = 0 if success else 1
+            
+            result = {
                 "success": success,
                 "output": output,
                 "error": error,
-                "container_id": container_id
+                "container_id": container_id,
+                "execution_time": execution_time,
+                "exit_code": exit_code
             }
+            
+            # Add execution metrics
+            result.update(execution_metrics)
+            
+            return result
     
     def cleanup(self):
         """Clean up all containers."""

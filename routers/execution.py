@@ -10,12 +10,10 @@ from database import get_db
 from services.docker_client import docker_client
 from code_executor import CodeExecutor
 from env_manager import EnvironmentManager
+from services.code_executor_service import get_code_executor
 import os
 
 router = APIRouter(tags=["execution"])
-
-# Initialize executor
-executor = CodeExecutor()
 
 # Container names (should be shared with containers router, but for now duplicated)
 container_names = {}  # container_id -> name
@@ -51,13 +49,13 @@ async def execute_web_service(request: CodeExecutionRequest, db: Session = Depen
             request.packages = []
             
         # Use the CodeExecutor method which handles web service detection
-        result = executor.execute_code(
+        result = get_code_executor().execute_code(
             code=request.code,
             packages=request.packages,
             timeout=60  # Longer timeout for web services
         )
         
-        # Log the execution
+        # Log the execution with enhanced metrics
         container_id = result.get("container_id")
         log = ExecutionLog(
             job_id=request.job_id if hasattr(request, 'job_id') else None,
@@ -65,9 +63,23 @@ async def execute_web_service(request: CodeExecutionRequest, db: Session = Depen
             output=result.get("output"),
             error=result.get("error"),
             container_id=container_id,
-            execution_time=time.time() - start_time,
+            execution_time=result.get("execution_time", time.time() - start_time),
             started_at=datetime.utcnow(),
-            status="success" if result.get("success") else "error"
+            status="success" if result.get("success") else "error",
+            # Enhanced metrics
+            cpu_user_time=result.get("cpu_user_time"),
+            cpu_system_time=result.get("cpu_system_time"),
+            cpu_percent=result.get("cpu_percent"),
+            memory_usage=result.get("memory_usage"),
+            memory_peak=result.get("memory_peak"),
+            memory_percent=result.get("memory_percent"),
+            memory_limit=result.get("memory_limit"),
+            block_io_read=result.get("block_io_read"),
+            block_io_write=result.get("block_io_write"),
+            network_io_rx=result.get("network_io_rx"),
+            network_io_tx=result.get("network_io_tx"),
+            pids_count=result.get("pids_count"),
+            exit_code=result.get("exit_code")
         )
         db.add(log)
         db.commit()
@@ -116,7 +128,7 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
 
         if request.container_id:
             # Verify container exists
-            if request.container_id not in executor.containers.values():
+            if request.container_id not in get_code_executor().containers.values():
                 raise HTTPException(status_code=404, detail="Container not found")
             
             # Execute in existing container
@@ -170,13 +182,13 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                 request.packages = []
             
             # Use the proper executor method
-            result = executor.execute_code(
+            result = get_code_executor().execute_code(
                 code=request.code,
                 packages=request.packages,
                 timeout=30
             )
             
-            # Log the execution
+            # Log the execution with enhanced metrics
             container_id = result.get("container_id")
             log = ExecutionLog(
                 job_id=request.job_id if hasattr(request, 'job_id') else None,
@@ -184,20 +196,49 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                 output=result.get("output"),
                 error=result.get("error"),
                 container_id=container_id,
-                execution_time=time.time() - start_time,
+                execution_time=result.get("execution_time", time.time() - start_time),
                 started_at=datetime.utcnow(),
-                status="success" if result.get("success") else "error"
+                status="success" if result.get("success") else "error",
+                # Enhanced metrics
+                cpu_user_time=result.get("cpu_user_time"),
+                cpu_system_time=result.get("cpu_system_time"),
+                cpu_percent=result.get("cpu_percent"),
+                memory_usage=result.get("memory_usage"),
+                memory_peak=result.get("memory_peak"),
+                memory_percent=result.get("memory_percent"),
+                memory_limit=result.get("memory_limit"),
+                block_io_read=result.get("block_io_read"),
+                block_io_write=result.get("block_io_write"),
+                network_io_rx=result.get("network_io_rx"),
+                network_io_tx=result.get("network_io_tx"),
+                pids_count=result.get("pids_count"),
+                exit_code=result.get("exit_code")
             )
             db.add(log)
             db.commit()
             
-            # Return the result from CodeExecutor with additional info
+            # Return the result from CodeExecutor with additional info and enhanced metrics
             response = {
                 "success": result.get("success"),
                 "output": result.get("output"),
                 "error": result.get("error"),
                 "container_id": container_id,
-                "container_name": container_names.get(container_id, "Unnamed")
+                "container_name": container_names.get(container_id, "Unnamed"),
+                "execution_time": result.get("execution_time"),
+                # Enhanced execution metrics
+                "cpu_user_time": result.get("cpu_user_time"),
+                "cpu_system_time": result.get("cpu_system_time"),
+                "cpu_percent": result.get("cpu_percent"),
+                "memory_usage": result.get("memory_usage"),
+                "memory_peak": result.get("memory_peak"),
+                "memory_percent": result.get("memory_percent"),
+                "memory_limit": result.get("memory_limit"),
+                "block_io_read": result.get("block_io_read"),
+                "block_io_write": result.get("block_io_write"),
+                "network_io_rx": result.get("network_io_rx"),
+                "network_io_tx": result.get("network_io_tx"),
+                "pids_count": result.get("pids_count"),
+                "exit_code": result.get("exit_code")
             }
             
             # Include web service info if available
@@ -238,7 +279,7 @@ async def debug_containers():
     """
     try:
         containers_info = []
-        for package_hash, container_id in executor.containers.items():
+        for package_hash, container_id in get_code_executor().containers.items():
             try:
                 container = docker_client.containers.get(container_id)
                 containers_info.append({
@@ -248,7 +289,7 @@ async def debug_containers():
                     "status": container.status,
                     "image": container.image.tags[0] if container.image.tags else "unknown",
                     "ports": container.ports,
-                    "is_web_service": container_id in executor.web_service_containers
+                    "is_web_service": container_id in get_code_executor().web_service_containers
                 })
             except Exception as e:
                 containers_info.append({
@@ -258,7 +299,7 @@ async def debug_containers():
                 })
         
         web_services_info = []
-        for container_id, service_info in executor.web_service_containers.items():
+        for container_id, service_info in get_code_executor().web_service_containers.items():
             web_services_info.append({
                 "container_id": container_id,
                 "container_short_id": container_id[:8],
@@ -271,8 +312,8 @@ async def debug_containers():
         return {
             "containers": containers_info,
             "web_services": web_services_info,
-            "total_containers": len(executor.containers),
-            "total_web_services": len(executor.web_service_containers)
+            "total_containers": len(get_code_executor().containers),
+            "total_web_services": len(get_code_executor().web_service_containers)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
@@ -285,7 +326,7 @@ async def get_container_logs(container_id: str):
     try:
         # Find the full container ID
         full_container_id = None
-        for stored_id in executor.containers.values():
+        for stored_id in get_code_executor().containers.values():
             if stored_id.startswith(container_id) or stored_id == container_id:
                 full_container_id = stored_id
                 break
@@ -300,7 +341,7 @@ async def get_container_logs(container_id: str):
         
         # If it's a web service, also try to get the service log
         service_log = ""
-        if full_container_id in executor.web_service_containers:
+        if full_container_id in get_code_executor().web_service_containers:
             try:
                 result = container.exec_run("cat /tmp/service.log", demux=False)
                 if result.exit_code == 0:
@@ -313,7 +354,7 @@ async def get_container_logs(container_id: str):
             "container_short_id": full_container_id[:8],
             "container_logs": logs,
             "service_log": service_log,
-            "is_web_service": full_container_id in executor.web_service_containers
+            "is_web_service": full_container_id in get_code_executor().web_service_containers
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting logs: {str(e)}") 

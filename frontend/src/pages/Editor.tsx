@@ -1,13 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { Box, Grid, Paper, Typography, Button, TextField, IconButton, Switch, FormControlLabel, MenuItem, Divider, Alert, Link } from '@mui/material';
-import { Add as AddIcon, Delete as DeleteIcon, PlayArrow as PlayIcon, Launch as LaunchIcon } from '@mui/icons-material';
+import { Box, Grid, Paper, Typography, Button, TextField, IconButton, Switch, FormControlLabel, MenuItem, Divider, Alert, Link, Dialog, DialogTitle, DialogContent, DialogActions } from '@mui/material';
+import { Add as AddIcon, Delete as DeleteIcon, PlayArrow as PlayIcon, Launch as LaunchIcon, Save as SaveIcon, Folder as FolderIcon } from '@mui/icons-material';
 import Editor from '@monaco-editor/react';
 import api from '../config/api';
 
-interface Container {
+interface CodeSession {
   id: string;
   name: string;
+  code: string;
+  packages: string[];
   created_at: string;
+  updated_at: string;
 }
 
 interface WebService {
@@ -127,7 +130,7 @@ if __name__ == '__main__':
   },
   dash: {
     name: 'Dash App',
-    packages: ['dash', 'plotly'],
+    packages: ['dash', 'plotly', 'pandas', 'numpy'],
     code: `import dash
 from dash import dcc, html, Input, Output
 import plotly.express as px
@@ -176,7 +179,7 @@ def update_graph(selected_city):
     return fig
 
 if __name__ == '__main__':
-    app.run_server(host='0.0.0.0', port=8050, debug=True)
+    app.run(host='0.0.0.0', port=8050, debug=True)
 `
   }
 };
@@ -186,25 +189,43 @@ const CodeEditor: React.FC = () => {
   const [code, setCode] = useState(appTemplates.basic.code);
   const [packages, setPackages] = useState<string[]>(['']);
   const [output, setOutput] = useState<string>('');
-  const [selectedContainer, setSelectedContainer] = useState<string>('');
   const [isScheduled, setIsScheduled] = useState(false);
   const [scheduleName, setScheduleName] = useState('');
   const [cronExpression, setCronExpression] = useState('');
-  const [containers, setContainers] = useState<Container[]>([]);
   const [isExecuting, setIsExecuting] = useState(false);
   const [executionTime, setExecutionTime] = useState<number | null>(null);
   const [webService, setWebService] = useState<WebService | null>(null);
+  
+  // Code session management
+  const [codeSessions, setCodeSessions] = useState<CodeSession[]>([]);
+  const [selectedSession, setSelectedSession] = useState<string>('');
+  const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [sessionName, setSessionName] = useState('');
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchContainers();
+    loadCodeSessions();
   }, []);
 
-  const fetchContainers = async () => {
+  // Load saved code sessions from localStorage
+  const loadCodeSessions = () => {
     try {
-      const response = await api.get('/containers');
-      setContainers(response.data);
+      const sessions = localStorage.getItem('codeSessions');
+      if (sessions) {
+        setCodeSessions(JSON.parse(sessions));
+      }
     } catch (error) {
-      console.error('Error fetching containers:', error);
+      console.error('Error loading code sessions:', error);
+    }
+  };
+
+  // Save code sessions to localStorage
+  const saveCodeSessions = (sessions: CodeSession[]) => {
+    try {
+      localStorage.setItem('codeSessions', JSON.stringify(sessions));
+      setCodeSessions(sessions);
+    } catch (error) {
+      console.error('Error saving code sessions:', error);
     }
   };
 
@@ -213,7 +234,65 @@ const CodeEditor: React.FC = () => {
     setSelectedTemplate(templateKey);
     setCode(template.code);
     setPackages(template.packages.length > 0 ? template.packages : ['']);
-    setWebService(null); // Clear any previous web service info
+    setWebService(null);
+    setCurrentSessionId(null);
+    setSelectedSession('');
+  };
+
+  const handleSessionLoad = (sessionId: string) => {
+    const session = codeSessions.find((s: CodeSession) => s.id === sessionId);
+    if (session) {
+      setCode(session.code);
+      setPackages(session.packages.length > 0 ? session.packages : ['']);
+      setSelectedSession(sessionId);
+      setCurrentSessionId(sessionId);
+      setSelectedTemplate(''); // Clear template selection
+      setWebService(null);
+    }
+  };
+
+  const handleSaveSession = () => {
+    if (!sessionName.trim()) return;
+
+    const now = new Date().toISOString();
+    const sessionToSave: CodeSession = {
+      id: currentSessionId || Date.now().toString(),
+      name: sessionName.trim(),
+      code,
+      packages: packages.filter((p: string) => p.trim() !== ''),
+      created_at: currentSessionId ? codeSessions.find((s: CodeSession) => s.id === currentSessionId)?.created_at || now : now,
+      updated_at: now
+    };
+
+    let updatedSessions: CodeSession[];
+    if (currentSessionId) {
+      // Update existing session
+      updatedSessions = codeSessions.map((s: CodeSession) => s.id === currentSessionId ? sessionToSave : s);
+    } else {
+      // Create new session
+      updatedSessions = [...codeSessions, sessionToSave];
+    }
+
+    saveCodeSessions(updatedSessions);
+    setCurrentSessionId(sessionToSave.id);
+    setSelectedSession(sessionToSave.id);
+    setShowSaveDialog(false);
+    setSessionName('');
+  };
+
+  const handleDeleteSession = (sessionId: string) => {
+    const updatedSessions = codeSessions.filter((s: CodeSession) => s.id !== sessionId);
+    saveCodeSessions(updatedSessions);
+    if (selectedSession === sessionId) {
+      setSelectedSession('');
+      setCurrentSessionId(null);
+    }
+  };
+
+  const openSaveDialog = () => {
+    const currentSession = currentSessionId ? codeSessions.find((s: CodeSession) => s.id === currentSessionId) : null;
+    setSessionName(currentSession?.name || '');
+    setShowSaveDialog(true);
   };
 
   const handleAddPackage = () => {
@@ -221,7 +300,7 @@ const CodeEditor: React.FC = () => {
   };
 
   const handleRemovePackage = (index: number) => {
-    setPackages(packages.filter((_, i) => i !== index));
+    setPackages(packages.filter((_: string, i: number) => i !== index));
   };
 
   const handlePackageChange = (index: number, value: string) => {
@@ -246,7 +325,6 @@ const CodeEditor: React.FC = () => {
           code,
           cron_expression: cronExpression,
           packages: packages.filter(p => p.trim() !== ''),
-          container_id: selectedContainer || undefined,
         });
         const endTime = Date.now();
         const execTime = endTime - startTime;
@@ -257,7 +335,6 @@ const CodeEditor: React.FC = () => {
         const response = await api.post('/execute', {
           code,
           packages: packages.filter(p => p.trim() !== ''),
-          container_id: selectedContainer || undefined,
         });
         const endTime = Date.now();
         const execTime = endTime - startTime;
@@ -280,16 +357,6 @@ const CodeEditor: React.FC = () => {
     }
   };
 
-  const getServiceTypeColor = (serviceType: string) => {
-    const colors: { [key: string]: 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info' } = {
-      streamlit: 'error',
-      fastapi: 'success',
-      flask: 'info',
-      dash: 'warning',
-    };
-    return colors[serviceType] || 'primary';
-  };
-
   return (
     <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
       {/* Top toolbar */}
@@ -307,6 +374,15 @@ const CodeEditor: React.FC = () => {
           }}
         >
           {isExecuting ? 'Running...' : (isScheduled ? 'Schedule Job' : 'Run')}
+        </Button>
+        
+        <Button
+          variant="outlined"
+          startIcon={<SaveIcon />}
+          onClick={openSaveDialog}
+          sx={{ px: 2 }}
+        >
+          {currentSessionId ? 'Update' : 'Save'}
         </Button>
         
         <TextField
@@ -327,15 +403,18 @@ const CodeEditor: React.FC = () => {
         <TextField
           select
           size="small"
-          label="Container"
-          value={selectedContainer}
-          onChange={(e) => setSelectedContainer(e.target.value)}
+          label="Saved Sessions"
+          value={selectedSession}
+          onChange={(e) => handleSessionLoad(e.target.value)}
           sx={{ minWidth: 200 }}
         >
-          <MenuItem value="">New Container</MenuItem>
-          {containers.map((container) => (
-            <MenuItem key={container.id} value={container.id}>
-              {container.name}
+          <MenuItem value="">
+            <em>None</em>
+          </MenuItem>
+          {codeSessions.map((session) => (
+            <MenuItem key={session.id} value={session.id}>
+              <FolderIcon sx={{ mr: 1, fontSize: 16 }} />
+              {session.name}
             </MenuItem>
           ))}
         </TextField>
@@ -352,9 +431,21 @@ const CodeEditor: React.FC = () => {
       </Box>
 
       {/* Main content area */}
-      <Box sx={{ display: 'flex', flexGrow: 1, gap: 1, minHeight: 0 }}>
+      <Box sx={{ 
+        display: 'flex', 
+        flexDirection: { xs: 'column', md: 'row' },
+        flexGrow: 1, 
+        gap: 1, 
+        minHeight: 0 
+      }}>
         {/* Left side - Code editor */}
-        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        <Box sx={{ 
+          flex: 1, 
+          display: 'flex', 
+          flexDirection: 'column',
+          minWidth: 0, // Allow flex item to shrink below content size
+          minHeight: { xs: '400px', md: 'auto' }, // Minimum height on mobile
+        }}>
           <Paper sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
             <Editor
               height="100%"
@@ -367,18 +458,34 @@ const CodeEditor: React.FC = () => {
                 fontSize: 14,
                 wordWrap: 'on',
                 scrollBeyondLastLine: false,
+                automaticLayout: true, // Enable automatic layout on resize
               }}
             />
           </Paper>
         </Box>
 
         {/* Right side - Settings and Output */}
-        <Box sx={{ width: '400px', display: 'flex', flexDirection: 'column', gap: 2, pr: 2 }}>
+        <Box sx={{ 
+          width: { xs: '100%', md: '350px', lg: '400px', xl: '450px' },
+          maxWidth: { xs: 'none', md: '40%' },
+          minWidth: { xs: 'auto', md: '300px' },
+          display: 'flex', 
+          flexDirection: 'column', 
+          gap: 2, 
+          pr: { xs: 0, md: 2 }
+        }}>
           {/* Settings panel */}
           <Paper sx={{ p: 2 }}>
-            <Typography variant="h6" gutterBottom>
-              Packages
-            </Typography>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+              <Typography variant="h6">
+                Packages
+              </Typography>
+              {currentSessionId && (
+                <Typography variant="caption" color="primary">
+                  Session: {codeSessions.find(s => s.id === currentSessionId)?.name}
+                </Typography>
+              )}
+            </Box>
             {packages.map((package_, index) => (
               <Box key={index} sx={{ display: 'flex', mb: 1 }}>
                 <TextField
@@ -509,6 +616,40 @@ const CodeEditor: React.FC = () => {
           </Paper>
         </Box>
       </Box>
+
+      {/* Save Session Dialog */}
+      <Dialog open={showSaveDialog} onClose={() => setShowSaveDialog(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>
+          {currentSessionId ? 'Update Code Session' : 'Save Code Session'}
+        </DialogTitle>
+        <DialogContent>
+          <TextField
+            autoFocus
+            margin="dense"
+            label="Session Name"
+            fullWidth
+            variant="outlined"
+            value={sessionName}
+            onChange={(e) => setSessionName(e.target.value)}
+            placeholder="Enter a name for this code session"
+          />
+          <Box sx={{ mt: 2 }}>
+            <Typography variant="body2" color="text.secondary">
+              This will save your current code and package dependencies for easy reuse.
+            </Typography>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setShowSaveDialog(false)}>Cancel</Button>
+          <Button 
+            onClick={handleSaveSession} 
+            variant="contained"
+            disabled={!sessionName.trim()}
+          >
+            {currentSessionId ? 'Update' : 'Save'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };
