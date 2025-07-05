@@ -9,30 +9,6 @@ class CodeExecutionRequest(BaseModel):
     timeout: Optional[int] = 30
     container_id: Optional[str] = None
 
-class ExecutionResponse(BaseModel):
-    success: bool
-    output: Optional[str]
-    error: Optional[str]
-    container_id: Optional[str]
-    container_name: Optional[str] = None
-    web_service: Optional[dict] = None
-    execution_time: Optional[float] = None
-    
-    # Enhanced execution metrics
-    cpu_user_time: Optional[float] = None
-    cpu_system_time: Optional[float] = None
-    cpu_percent: Optional[float] = None
-    memory_usage: Optional[int] = None
-    memory_peak: Optional[int] = None
-    memory_percent: Optional[float] = None
-    memory_limit: Optional[int] = None
-    block_io_read: Optional[int] = None
-    block_io_write: Optional[int] = None
-    network_io_rx: Optional[int] = None
-    network_io_tx: Optional[int] = None
-    pids_count: Optional[int] = None
-    exit_code: Optional[int] = None
-
 class PackageInstallRequest(BaseModel):
     name: str
     packages: List[str]
@@ -50,6 +26,7 @@ class ScheduledJobRequest(BaseModel):
     cron_expression: str
     container_id: Optional[str] = None
     packages: Optional[List[str]] = None
+    timeout: Optional[int] = 30
 
 class ScheduledJobResponse(BaseModel):
     id: int
@@ -60,6 +37,7 @@ class ScheduledJobResponse(BaseModel):
     created_at: str
     last_run: Optional[str]
     is_active: bool
+    timeout: int
 
 class ExecutionLogResponse(BaseModel):
     id: int
@@ -74,21 +52,6 @@ class ExecutionLogResponse(BaseModel):
     status: str
     request_data: Optional[str]
     response_data: Optional[str]
-    
-    # Enhanced execution metrics
-    cpu_user_time: Optional[float]
-    cpu_system_time: Optional[float]
-    cpu_percent: Optional[float]
-    memory_usage: Optional[int]
-    memory_peak: Optional[int]
-    memory_percent: Optional[float]
-    memory_limit: Optional[int]
-    block_io_read: Optional[int]
-    block_io_write: Optional[int]
-    network_io_rx: Optional[int]
-    network_io_tx: Optional[int]
-    pids_count: Optional[int]
-    exit_code: Optional[int]
 
 class EnvVarRequest(BaseModel):
     name: str

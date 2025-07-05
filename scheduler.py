@@ -53,7 +53,8 @@ class JobScheduler:
             try:
                 result = self.executor.execute_code(
                     code=job.code,
-                    packages=job.packages.split(',') if job.packages else []
+                    packages=job.packages.split(',') if job.packages else [],
+                    timeout=getattr(job, 'timeout', 30)  # Use job timeout or default to 30
                 )
                 
                 execution_time = time.time() - start_time

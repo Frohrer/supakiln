@@ -7,9 +7,9 @@ import threading
 import base64
 import docker
 import random
-import resource
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from services.docker_client import docker_client
 
 class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
@@ -209,156 +209,80 @@ USER codeuser
         except Exception as e:
             return False, None, str(e)
     
-    def _collect_container_metrics(self, container_id: str) -> Dict:
-        """Collect detailed resource metrics from a container."""
-        metrics = {}
+    def _execute_with_streaming_timeout(self, container_id: str, command: str, timeout: int) -> Tuple[bool, str, Optional[str], bool]:
+        """Execute a command in a container with streaming output and timeout handling."""
+        import threading
+        import docker
         
-        try:
-            # Get container stats using Docker stats API
-            env = os.environ.copy()
-            stats_result = subprocess.run(
-                ["docker", "stats", container_id, "--no-stream", "--format", "json"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                env=env
-            )
-            
-            if stats_result.returncode == 0 and stats_result.stdout.strip():
-                stats_data = json.loads(stats_result.stdout.strip())
-                
-                # Parse CPU percentage
-                cpu_percent_str = stats_data.get("CPUPerc", "0%").rstrip('%')
-                metrics["cpu_percent"] = float(cpu_percent_str) if cpu_percent_str != "0" else 0.0
-                
-                # Parse memory usage
-                mem_usage_str = stats_data.get("MemUsage", "0B / 0B")
-                if "/" in mem_usage_str:
-                    usage_str, limit_str = mem_usage_str.split(" / ")
-                    metrics["memory_usage"] = self._parse_memory_string(usage_str)
-                    metrics["memory_limit"] = self._parse_memory_string(limit_str)
-                    
-                    # Calculate memory percentage
-                    if metrics["memory_limit"] > 0:
-                        metrics["memory_percent"] = (metrics["memory_usage"] / metrics["memory_limit"]) * 100
-                    else:
-                        metrics["memory_percent"] = 0.0
-                
-                # Parse Block I/O
-                block_io_str = stats_data.get("BlockIO", "0B / 0B")
-                if "/" in block_io_str:
-                    read_str, write_str = block_io_str.split(" / ")
-                    metrics["block_io_read"] = self._parse_memory_string(read_str)
-                    metrics["block_io_write"] = self._parse_memory_string(write_str)
-                
-                # Parse Network I/O
-                net_io_str = stats_data.get("NetIO", "0B / 0B")
-                if "/" in net_io_str:
-                    rx_str, tx_str = net_io_str.split(" / ")
-                    metrics["network_io_rx"] = self._parse_memory_string(rx_str)
-                    metrics["network_io_tx"] = self._parse_memory_string(tx_str)
-                
-                # Parse PIDs
-                pids_str = stats_data.get("PIDs", "0")
-                metrics["pids_count"] = int(pids_str) if pids_str.isdigit() else 0
-                
-        except Exception as e:
-            print(f"Warning: Could not collect container stats: {e}")
+        output_buffer = []
+        error_buffer = []
+        success = False
+        timed_out = False
         
-        # Try to get CPU time from cgroup files
-        try:
-            # Get CPU time from cgroup
-            cpu_time_result = subprocess.run(
-                ["docker", "exec", container_id, "cat", "/sys/fs/cgroup/cpu.stat"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                env=os.environ.copy()
-            )
-            
-            if cpu_time_result.returncode == 0:
-                cpu_stats = cpu_time_result.stdout.strip()
-                for line in cpu_stats.split('\n'):
-                    if line.startswith('usage_usec'):
-                        total_cpu_time = int(line.split()[1]) / 1000000.0  # Convert microseconds to seconds
-                        metrics["cpu_total_time"] = total_cpu_time
-                    elif line.startswith('user_usec'):
-                        user_time = int(line.split()[1]) / 1000000.0
-                        metrics["cpu_user_time"] = user_time
-                    elif line.startswith('system_usec'):
-                        system_time = int(line.split()[1]) / 1000000.0
-                        metrics["cpu_system_time"] = system_time
-        except Exception as e:
-            print(f"Warning: Could not collect CPU time from cgroup: {e}")
-            
-        # Try to get memory peak from cgroup
-        try:
-            memory_peak_result = subprocess.run(
-                ["docker", "exec", container_id, "cat", "/sys/fs/cgroup/memory.peak"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                env=os.environ.copy()
-            )
-            
-            if memory_peak_result.returncode == 0:
-                memory_peak = int(memory_peak_result.stdout.strip())
-                metrics["memory_peak"] = memory_peak
-        except Exception as e:
-            # Try alternative path for cgroup v1
+        def collect_output():
+            nonlocal success, timed_out
             try:
-                memory_peak_result = subprocess.run(
-                    ["docker", "exec", container_id, "cat", "/sys/fs/cgroup/memory/memory.max_usage_in_bytes"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    env=os.environ.copy()
+                container = docker_client.containers.get(container_id)
+                # Use stream=True to get streaming output
+                # Need to execute the command in a shell to handle pipes properly
+                result = container.exec_run(
+                    ["sh", "-c", command],
+                    stream=True,
+                    demux=True  # Separate stdout and stderr
                 )
                 
-                if memory_peak_result.returncode == 0:
-                    memory_peak = int(memory_peak_result.stdout.strip())
-                    metrics["memory_peak"] = memory_peak
-            except Exception:
-                print(f"Warning: Could not collect peak memory usage: {e}")
+                # Collect streaming output
+                for stdout_chunk, stderr_chunk in result.output:
+                    if stdout_chunk:
+                        chunk_text = stdout_chunk.decode('utf-8', errors='replace')
+                        output_buffer.append(chunk_text)
+                    if stderr_chunk:
+                        chunk_text = stderr_chunk.decode('utf-8', errors='replace')
+                        error_buffer.append(chunk_text)
+                
+                # Check exit code
+                success = result.exit_code == 0
+                
+            except Exception as e:
+                error_buffer.append(f"Execution error: {str(e)}")
         
-        return metrics
-    
-    def _parse_memory_string(self, mem_str: str) -> int:
-        """Parse memory string like '1.5MiB' to bytes."""
-        if not mem_str or mem_str == "0B":
-            return 0
+        # Start output collection in a separate thread
+        output_thread = threading.Thread(target=collect_output)
+        output_thread.daemon = True
+        output_thread.start()
+        
+        # Wait for completion or timeout
+        output_thread.join(timeout)
+        
+        if output_thread.is_alive():
+            # Thread is still running, so we timed out
+            timed_out = True
+            # Try to stop the execution in the container
+            try:
+                container = docker_client.containers.get(container_id)
+                # Kill the process in the container
+                container.exec_run("pkill -f python", detach=True)
+            except:
+                pass
             
-        # Remove whitespace
-        mem_str = mem_str.strip()
+            # Give it a moment to clean up
+            output_thread.join(1)
         
-        # Handle different units
-        units = {
-            'B': 1,
-            'KiB': 1024,
-            'MiB': 1024 * 1024,
-            'GiB': 1024 * 1024 * 1024,
-            'KB': 1000,
-            'MB': 1000 * 1000,
-            'GB': 1000 * 1000 * 1000,
-            'kB': 1000,
-            'mB': 1000 * 1000,
-            'gB': 1000 * 1000 * 1000,
-        }
+        # Combine output
+        combined_output = ''.join(output_buffer) if output_buffer else None
+        combined_error = ''.join(error_buffer) if error_buffer else None
         
-        for unit, multiplier in units.items():
-            if mem_str.endswith(unit):
-                value_str = mem_str[:-len(unit)]
-                try:
-                    value = float(value_str)
-                    return int(value * multiplier)
-                except ValueError:
-                    break
+        # If we timed out, add timeout message
+        if timed_out:
+            timeout_msg = f"\n--- Execution timed out after {timeout} seconds ---"
+            if combined_output:
+                combined_output += timeout_msg
+            elif combined_error:
+                combined_error += timeout_msg
+            else:
+                combined_error = f"Execution timed out after {timeout} seconds"
         
-        # If no unit found, assume bytes
-        try:
-            return int(float(mem_str))
-        except ValueError:
-            return 0
+        return success and not timed_out, combined_output, combined_error, timed_out
     
     def execute_code(self, code: str, packages: List[str], timeout: int = 30) -> Dict:
         """
@@ -699,69 +623,18 @@ export PYTHONPATH=/tmp:$PYTHONPATH
             
             container_id = self.containers[package_hash]
             
-            # Regular code execution with metrics collection
+            # Regular code execution
             encoded_code = base64.b64encode(code.encode()).decode()
             exec_command = f"echo '{encoded_code}' | base64 -d | python3"
+            success, output, error, timed_out = self._execute_with_streaming_timeout(container_id, exec_command, timeout)
             
-            # Get initial metrics before execution
-            initial_metrics = self._collect_container_metrics(container_id)
-            
-            # Execute the code
-            execution_start_time = time.time()
-            success, output, error = self._execute_with_timeout(container_id, exec_command, timeout)
-            execution_time = time.time() - execution_start_time
-            
-            # Get final metrics after execution
-            final_metrics = self._collect_container_metrics(container_id)
-            
-            # Calculate differential metrics (execution-specific)
-            execution_metrics = {}
-            for key in ["cpu_user_time", "cpu_system_time", "block_io_read", "block_io_write", "network_io_rx", "network_io_tx"]:
-                if key in final_metrics and key in initial_metrics:
-                    execution_metrics[key] = final_metrics[key] - initial_metrics[key]
-                elif key in final_metrics:
-                    execution_metrics[key] = final_metrics[key]
-            
-            # Use final metrics for current values
-            for key in ["cpu_percent", "memory_usage", "memory_peak", "memory_percent", "memory_limit", "pids_count"]:
-                if key in final_metrics:
-                    execution_metrics[key] = final_metrics[key]
-            
-            # Try to get the exit code from the last command
-            exit_code = None
-            try:
-                exit_code_result = subprocess.run(
-                    ["docker", "exec", container_id, "echo", "$?"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    env=os.environ.copy()
-                )
-                if exit_code_result.returncode == 0:
-                    try:
-                        exit_code = int(exit_code_result.stdout.strip())
-                    except ValueError:
-                        pass
-            except Exception:
-                pass
-            
-            # If we couldn't get the exit code, infer it from success
-            if exit_code is None:
-                exit_code = 0 if success else 1
-            
-            result = {
+            return {
                 "success": success,
                 "output": output,
                 "error": error,
                 "container_id": container_id,
-                "execution_time": execution_time,
-                "exit_code": exit_code
+                "timed_out": timed_out
             }
-            
-            # Add execution metrics
-            result.update(execution_metrics)
-            
-            return result
     
     def cleanup(self):
         """Clean up all containers."""

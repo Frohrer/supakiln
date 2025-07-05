@@ -20,6 +20,7 @@ async def create_scheduled_job(request: ScheduledJobRequest, db: Session = Depen
             cron_expression=request.cron_expression,
             packages=','.join(request.packages) if request.packages else None,
             container_id=request.container_id,
+            timeout=request.timeout,
             created_at=datetime.now(),
             is_active=True
         )
@@ -40,7 +41,8 @@ async def create_scheduled_job(request: ScheduledJobRequest, db: Session = Depen
             "container_id": db_job.container_id,
             "created_at": db_job.created_at.isoformat(),
             "last_run": db_job.last_run.isoformat() if db_job.last_run else None,
-            "is_active": db_job.is_active
+            "is_active": db_job.is_active,
+            "timeout": db_job.timeout
         }
     except Exception as e:
         db.rollback()
@@ -61,7 +63,8 @@ async def list_scheduled_jobs(db: Session = Depends(get_db)):
             "container_id": job.container_id,
             "created_at": job.created_at.isoformat(),
             "last_run": job.last_run.isoformat() if job.last_run else None,
-            "is_active": job.is_active
+            "is_active": job.is_active,
+            "timeout": job.timeout
         }
         for job in jobs
     ]
@@ -84,7 +87,8 @@ async def update_scheduled_job(job_id: int, request: ScheduledJobRequest, db: Se
             code=request.code,
             cron_expression=request.cron_expression,
             container_id=request.container_id,
-            packages=','.join(request.packages) if request.packages else None
+            packages=','.join(request.packages) if request.packages else None,
+            timeout=request.timeout
         )
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
