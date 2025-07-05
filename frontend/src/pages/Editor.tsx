@@ -195,6 +195,7 @@ const CodeEditor: React.FC = () => {
   const [isExecuting, setIsExecuting] = useState(false);
   const [executionTime, setExecutionTime] = useState<number | null>(null);
   const [webService, setWebService] = useState<WebService | null>(null);
+  const [timeout, setTimeout] = useState(30); // Default timeout in seconds
   
   // Code session management
   const [codeSessions, setCodeSessions] = useState<CodeSession[]>([]);
@@ -325,6 +326,7 @@ const CodeEditor: React.FC = () => {
           code,
           cron_expression: cronExpression,
           packages: packages.filter(p => p.trim() !== ''),
+          timeout: timeout,
         });
         const endTime = Date.now();
         const execTime = endTime - startTime;
@@ -335,6 +337,7 @@ const CodeEditor: React.FC = () => {
         const response = await api.post('/execute', {
           code,
           packages: packages.filter(p => p.trim() !== ''),
+          timeout: timeout,
         });
         const endTime = Date.now();
         const execTime = endTime - startTime;
@@ -512,6 +515,31 @@ const CodeEditor: React.FC = () => {
             >
               Add Package
             </Button>
+
+            {/* Timeout Settings */}
+            <Box sx={{ mt: 2 }}>
+              <Divider sx={{ my: 2 }} />
+              <Typography variant="h6" gutterBottom>
+                Execution Timeout
+              </Typography>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                <TextField
+                  type="number"
+                  size="small"
+                  label="Timeout (seconds)"
+                  value={timeout}
+                  onChange={(e) => setTimeout(Math.max(1, parseInt(e.target.value) || 1))}
+                  inputProps={{ min: 1, max: 300 }}
+                  sx={{ width: 150 }}
+                />
+                <Typography variant="caption" color="text.secondary">
+                  {timeout < 60 ? `${timeout}s` : `${Math.floor(timeout / 60)}m ${timeout % 60}s`}
+                </Typography>
+              </Box>
+              <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+                Maximum execution time (1-300 seconds)
+              </Typography>
+            </Box>
 
             {isScheduled && (
               <Box sx={{ mt: 2 }}>

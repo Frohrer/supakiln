@@ -55,7 +55,7 @@ async def execute_web_service(request: CodeExecutionRequest, db: Session = Depen
             timeout=60  # Longer timeout for web services
         )
         
-        # Log the execution with enhanced metrics
+        # Log the execution
         container_id = result.get("container_id")
         log = ExecutionLog(
             job_id=request.job_id if hasattr(request, 'job_id') else None,
@@ -63,23 +63,9 @@ async def execute_web_service(request: CodeExecutionRequest, db: Session = Depen
             output=result.get("output"),
             error=result.get("error"),
             container_id=container_id,
-            execution_time=result.get("execution_time", time.time() - start_time),
+            execution_time=time.time() - start_time,
             started_at=datetime.utcnow(),
-            status="success" if result.get("success") else "error",
-            # Enhanced metrics
-            cpu_user_time=result.get("cpu_user_time"),
-            cpu_system_time=result.get("cpu_system_time"),
-            cpu_percent=result.get("cpu_percent"),
-            memory_usage=result.get("memory_usage"),
-            memory_peak=result.get("memory_peak"),
-            memory_percent=result.get("memory_percent"),
-            memory_limit=result.get("memory_limit"),
-            block_io_read=result.get("block_io_read"),
-            block_io_write=result.get("block_io_write"),
-            network_io_rx=result.get("network_io_rx"),
-            network_io_tx=result.get("network_io_tx"),
-            pids_count=result.get("pids_count"),
-            exit_code=result.get("exit_code")
+            status="success" if result.get("success") else "error"
         )
         db.add(log)
         db.commit()
@@ -146,35 +132,99 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             # Encode the code in base64
             encoded_code = base64.b64encode(request.code.encode()).decode()
             
-            # Execute with environment variables
-            result = container.exec_run(
-                f"python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
-                environment=env_vars
-            )
+            # Execute with streaming output and timeout handling
+            output_buffer = []
+            error_buffer = []
+            success = False
+            timed_out = False
             
-            output = result.output.decode() if result.exit_code == 0 else None
-            error = result.output.decode() if result.exit_code != 0 else None
+            import threading
+            import signal
+            
+            def collect_output():
+                nonlocal success, timed_out
+                try:
+                    # Use stream=True to get streaming output
+                    result = container.exec_run(
+                        f"python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
+                        environment=env_vars,
+                        stream=True,
+                        demux=True  # Separate stdout and stderr
+                    )
+                    
+                    # Collect streaming output
+                    for stdout_chunk, stderr_chunk in result.output:
+                        if stdout_chunk:
+                            chunk_text = stdout_chunk.decode('utf-8', errors='replace')
+                            output_buffer.append(chunk_text)
+                        if stderr_chunk:
+                            chunk_text = stderr_chunk.decode('utf-8', errors='replace')
+                            error_buffer.append(chunk_text)
+                    
+                    # Check exit code
+                    success = result.exit_code == 0
+                    
+                except Exception as e:
+                    error_buffer.append(f"Execution error: {str(e)}")
+            
+            # Start output collection in a separate thread
+            output_thread = threading.Thread(target=collect_output)
+            output_thread.daemon = True
+            output_thread.start()
+            
+            # Wait for completion or timeout
+            timeout_seconds = request.timeout or 30
+            output_thread.join(timeout_seconds)
+            
+            if output_thread.is_alive():
+                # Thread is still running, so we timed out
+                timed_out = True
+                # Try to stop the execution in the container
+                try:
+                    # Kill the process in the container
+                    container.exec_run("pkill -f python", detach=True)
+                except:
+                    pass
+                
+                # Give it a moment to clean up
+                output_thread.join(1)
+            
+            # Combine output
+            combined_output = ''.join(output_buffer) if output_buffer else None
+            combined_error = ''.join(error_buffer) if error_buffer else None
+            
+            # If we timed out, add timeout message
+            if timed_out:
+                timeout_msg = f"\n--- Execution timed out after {timeout_seconds} seconds ---"
+                if combined_output:
+                    combined_output += timeout_msg
+                elif combined_error:
+                    combined_error += timeout_msg
+                else:
+                    combined_error = f"Execution timed out after {timeout_seconds} seconds"
+                success = False
             
             # Log the execution
             log = ExecutionLog(
                 job_id=request.job_id if hasattr(request, 'job_id') else None,
                 code=request.code,
-                output=output,
-                error=error,
+                output=combined_output,
+                error=combined_error,
                 container_id=request.container_id,
                 execution_time=time.time() - start_time,
                 started_at=datetime.utcnow(),
-                status="success" if result.exit_code == 0 else "error"
+                status="success" if success and not timed_out else "error"
             )
             db.add(log)
             db.commit()
             
             return {
-                "success": result.exit_code == 0,
-                "output": output,
-                "error": error,
+                "success": success and not timed_out,
+                "output": combined_output,
+                "error": combined_error,
                 "container_id": request.container_id,
-                "container_name": container_names.get(request.container_id, "Unnamed")
+                "container_name": container_names.get(request.container_id, "Unnamed"),
+                "timed_out": timed_out
             }
         else:
             # Use the CodeExecutor.execute_code method which handles web service detection
@@ -185,10 +235,10 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             result = get_code_executor().execute_code(
                 code=request.code,
                 packages=request.packages,
-                timeout=30
+                timeout=request.timeout or 30
             )
             
-            # Log the execution with enhanced metrics
+            # Log the execution
             container_id = result.get("container_id")
             log = ExecutionLog(
                 job_id=request.job_id if hasattr(request, 'job_id') else None,
@@ -196,49 +246,20 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                 output=result.get("output"),
                 error=result.get("error"),
                 container_id=container_id,
-                execution_time=result.get("execution_time", time.time() - start_time),
+                execution_time=time.time() - start_time,
                 started_at=datetime.utcnow(),
-                status="success" if result.get("success") else "error",
-                # Enhanced metrics
-                cpu_user_time=result.get("cpu_user_time"),
-                cpu_system_time=result.get("cpu_system_time"),
-                cpu_percent=result.get("cpu_percent"),
-                memory_usage=result.get("memory_usage"),
-                memory_peak=result.get("memory_peak"),
-                memory_percent=result.get("memory_percent"),
-                memory_limit=result.get("memory_limit"),
-                block_io_read=result.get("block_io_read"),
-                block_io_write=result.get("block_io_write"),
-                network_io_rx=result.get("network_io_rx"),
-                network_io_tx=result.get("network_io_tx"),
-                pids_count=result.get("pids_count"),
-                exit_code=result.get("exit_code")
+                status="success" if result.get("success") else "error"
             )
             db.add(log)
             db.commit()
             
-            # Return the result from CodeExecutor with additional info and enhanced metrics
+            # Return the result from CodeExecutor with additional info
             response = {
                 "success": result.get("success"),
                 "output": result.get("output"),
                 "error": result.get("error"),
                 "container_id": container_id,
-                "container_name": container_names.get(container_id, "Unnamed"),
-                "execution_time": result.get("execution_time"),
-                # Enhanced execution metrics
-                "cpu_user_time": result.get("cpu_user_time"),
-                "cpu_system_time": result.get("cpu_system_time"),
-                "cpu_percent": result.get("cpu_percent"),
-                "memory_usage": result.get("memory_usage"),
-                "memory_peak": result.get("memory_peak"),
-                "memory_percent": result.get("memory_percent"),
-                "memory_limit": result.get("memory_limit"),
-                "block_io_read": result.get("block_io_read"),
-                "block_io_write": result.get("block_io_write"),
-                "network_io_rx": result.get("network_io_rx"),
-                "network_io_tx": result.get("network_io_tx"),
-                "pids_count": result.get("pids_count"),
-                "exit_code": result.get("exit_code")
+                "container_name": container_names.get(container_id, "Unnamed")
             }
             
             # Include web service info if available

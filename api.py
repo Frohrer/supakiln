@@ -56,13 +56,33 @@ app.include_router(proxy.router)
 
 async def startup_event():
     """Initialize services on startup."""
+    import time
+    import sys
+    
+    # Run database migration with retry logic
+    max_retries = 5
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"Running database migration (attempt {attempt + 1}/{max_retries})...")
+            from migrate_database import migrate_database
+            migrate_database()
+            print("✅ Database migration completed successfully")
+            break
+        except Exception as e:
+            print(f"❌ Database migration failed (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"⏳ Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 1.5  # Exponential backoff
+            else:
+                print("💥 Failed to migrate database after all retries. Application may not function correctly.")
+                # Don't exit the app, just log the error
+                
+    # Auto-start services marked for auto-start
     try:
-        # Run database migration
-        from migrate_database import migrate_database
-        migrate_database()
-        print("Database migration completed")
-        
-        # Auto-start services marked for auto-start
+        print("🚀 Starting auto-start services...")
         db = SessionLocal()
         try:
             auto_start_services = db.query(PersistentService).filter(
@@ -70,14 +90,23 @@ async def startup_event():
                 PersistentService.is_active == 1
             ).all()
             
-            for service in auto_start_services:
-                print(f"Auto-starting service: {service.name}")
-                service_manager.start_service(service.id, db)
+            if auto_start_services:
+                print(f"Found {len(auto_start_services)} services to auto-start")
+                for service in auto_start_services:
+                    try:
+                        print(f"Starting service: {service.name}")
+                        service_manager.start_service(service.id, db)
+                        print(f"✅ Service {service.name} started successfully")
+                    except Exception as e:
+                        print(f"❌ Failed to start service {service.name}: {e}")
+            else:
+                print("No services configured for auto-start")
         finally:
             db.close()
-            
     except Exception as e:
-        print(f"Startup error: {e}")
+        print(f"❌ Error during service auto-start: {e}")
+        
+    print("🎉 Application startup completed")
 
 # Add startup event
 @app.on_event("startup")

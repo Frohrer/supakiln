@@ -28,6 +28,7 @@ class ScheduledJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_run = Column(DateTime)
     is_active = Column(Integer, default=1)  # 1 for active, 0 for inactive
+    timeout = Column(Integer, default=30)  # Timeout in seconds
 
 class WebhookJob(Base):
     __tablename__ = "webhook_jobs"
@@ -88,26 +89,11 @@ class ExecutionLog(Base):
     output = Column(Text)
     error = Column(Text)
     container_id = Column(String(100))
-    execution_time = Column(Float)  # in seconds (wall clock time)
+    execution_time = Column(Float)  # in seconds
     started_at = Column(DateTime, default=datetime.utcnow)
     status = Column(String(20))  # success, error, timeout, running
     request_data = Column(Text)  # For webhook jobs: the request payload
     response_data = Column(Text)  # For webhook jobs: the response payload
-    
-    # Enhanced execution metrics
-    cpu_user_time = Column(Float)  # CPU time spent in user mode (seconds)
-    cpu_system_time = Column(Float)  # CPU time spent in kernel mode (seconds)
-    cpu_percent = Column(Float)  # CPU usage percentage during execution
-    memory_usage = Column(Integer)  # Current memory usage (bytes)
-    memory_peak = Column(Integer)  # Peak memory usage (bytes)
-    memory_percent = Column(Float)  # Memory usage percentage
-    memory_limit = Column(Integer)  # Memory limit (bytes)
-    block_io_read = Column(Integer)  # Block I/O read bytes
-    block_io_write = Column(Integer)  # Block I/O write bytes
-    network_io_rx = Column(Integer)  # Network I/O received bytes
-    network_io_tx = Column(Integer)  # Network I/O transmitted bytes
-    pids_count = Column(Integer)  # Number of processes/threads
-    exit_code = Column(Integer)  # Process exit code
 
 # Create database and tables
 engine = create_engine('sqlite:///code_executor.db')
