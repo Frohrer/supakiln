@@ -95,12 +95,12 @@ class ExecutionLog(Base):
     request_data = Column(Text)  # For webhook jobs: the request payload
     response_data = Column(Text)  # For webhook jobs: the response payload
 
-# Create database and tables
+# Create database engine and session factory
 engine = create_engine('sqlite:///code_executor.db')
-Base.metadata.create_all(engine)
-
-# Create session factory
 SessionLocal = sessionmaker(bind=engine)
+
+# Note: Tables are created by the migration system in migrate_database.py
+# This ensures proper version tracking and schema migrations
 
 def get_db():
     db = SessionLocal()

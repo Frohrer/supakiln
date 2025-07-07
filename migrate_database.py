@@ -33,9 +33,90 @@ def migrate_database():
             
         print(f"Current database version: {current_version}")
         
-        # Migration 1: Create schema_info table
+        # If version is 0, check if tables already exist with current schema
+        # This handles the case where SQLAlchemy created tables before migration runs
+        if current_version == 0:
+            print("Checking existing table schemas...")
+            
+            # Check if base tables exist
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='scheduled_jobs'")
+            scheduled_jobs_exists = cursor.fetchone() is not None
+            
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='environment_variables'")
+            environment_variables_exists = cursor.fetchone() is not None
+            
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_logs'")
+            execution_logs_exists = cursor.fetchone() is not None
+            
+            if scheduled_jobs_exists and environment_variables_exists and execution_logs_exists:
+                # Base tables exist, check their schemas
+                
+                # Check if scheduled_jobs table has timeout column
+                cursor.execute("PRAGMA table_info(scheduled_jobs)")
+                scheduled_jobs_columns = [row[1] for row in cursor.fetchall()]
+                
+                # Check if webhook_jobs table exists and has timeout column
+                cursor.execute("PRAGMA table_info(webhook_jobs)")
+                webhook_jobs_columns = [row[1] for row in cursor.fetchall()]
+                
+                # Check if persistent_services table exists
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='persistent_services'")
+                persistent_services_exists = cursor.fetchone() is not None
+                
+                # Check if exposed_ports table exists
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='exposed_ports'")
+                exposed_ports_exists = cursor.fetchone() is not None
+                
+                # Check if execution_logs has service_id and webhook_job_id columns
+                cursor.execute("PRAGMA table_info(execution_logs)")
+                execution_logs_columns = [row[1] for row in cursor.fetchall()]
+                
+                # Check if environment_variables has description column
+                cursor.execute("PRAGMA table_info(environment_variables)")
+                env_vars_columns = [row[1] for row in cursor.fetchall()]
+                
+                # Determine the appropriate version based on existing schema
+                if ('timeout' in scheduled_jobs_columns and 
+                    'timeout' in webhook_jobs_columns and
+                    persistent_services_exists and
+                    exposed_ports_exists and
+                    'service_id' in execution_logs_columns and
+                    'webhook_job_id' in execution_logs_columns and
+                    'description' in env_vars_columns):
+                    # All migrations are already applied, set to latest version
+                    current_version = 7
+                    print("All tables exist with current schema, setting version to 7")
+                elif ('timeout' in webhook_jobs_columns and
+                      persistent_services_exists and
+                      exposed_ports_exists and
+                      'service_id' in execution_logs_columns and
+                      'webhook_job_id' in execution_logs_columns and
+                      'description' in env_vars_columns):
+                    # Need to add timeout to scheduled_jobs
+                    current_version = 6
+                    print("Missing timeout column in scheduled_jobs, setting version to 6")
+                elif (len(webhook_jobs_columns) > 0 and
+                      persistent_services_exists and
+                      exposed_ports_exists and
+                      'service_id' in execution_logs_columns and
+                      'webhook_job_id' in execution_logs_columns and
+                      'description' in env_vars_columns):
+                    # webhook_jobs exists but might be missing timeout, other tables complete
+                    current_version = 5
+                    print("Tables exist but schema incomplete, setting version to 5")
+                else:
+                    # Base tables exist but schema is incomplete, start from version 1
+                    current_version = 1
+                    print("Base tables exist but schema incomplete, setting version to 1")
+            else:
+                # Base tables don't exist, start from version 0
+                print("Base tables don't exist, starting from version 0")
+            
+        # Migration 1: Create base tables and schema_info table
         if current_version < 1:
-            print("Applying migration 1: Creating schema_info table...")
+            print("Applying migration 1: Creating base tables and schema_info table...")
+            
+            # Create schema_info table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS schema_info (
                     key TEXT PRIMARY KEY,
@@ -43,6 +124,50 @@ def migrate_database():
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            
+            # Create environment_variables table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS environment_variables (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR(100) UNIQUE NOT NULL,
+                    value TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create scheduled_jobs table (without timeout column initially)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    code TEXT NOT NULL,
+                    cron_expression VARCHAR(100) NOT NULL,
+                    container_id VARCHAR(100),
+                    packages TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_run TIMESTAMP,
+                    is_active INTEGER DEFAULT 1
+                )
+            """)
+            
+            # Create execution_logs table (without additional columns initially)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS execution_logs (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER,
+                    code TEXT NOT NULL,
+                    output TEXT,
+                    error TEXT,
+                    container_id VARCHAR(100),
+                    execution_time REAL,
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status VARCHAR(20),
+                    request_data TEXT,
+                    response_data TEXT
+                )
+            """)
+            
             cursor.execute("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '1')")
             current_version = 1
         
@@ -163,6 +288,17 @@ def migrate_database():
             
             cursor.execute("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '7')")
             current_version = 7
+        
+        # Ensure schema_info table is created and version is set correctly
+        if current_version >= 1:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS schema_info (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', ?)", (str(current_version),))
         
         conn.commit()
         print(f"Database migration completed. Current version: {current_version}")
