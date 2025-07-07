@@ -1,5 +1,9 @@
 version: '3.8'
 
+volumes:
+  database_volume:
+    driver: local
+
 services:
   frontend:
     build:
@@ -80,7 +84,7 @@ services:
     volumes:
       - .:/app:ro  # Mount as read-only for security
       - ./logs:/app/logs:rw  # Allow writes only to logs directory
-      - ./data:/app/data:rw  # Allow writes for database and data files
+      - database_volume:/app/data  # Use Docker volume for database files
     security_opt:
       - seccomp=./security/seccomp-profile.json
       - no-new-privileges=true
