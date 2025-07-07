@@ -96,7 +96,9 @@ class ExecutionLog(Base):
     response_data = Column(Text)  # For webhook jobs: the response payload
 
 # Create database engine and session factory
-engine = create_engine('sqlite:///code_executor.db')
+# Use data directory for writable files when in container, fallback to current dir for development
+db_path = '/app/data/code_executor.db' if os.path.exists('/app/data') else 'code_executor.db'
+engine = create_engine(f'sqlite:///{db_path}')
 SessionLocal = sessionmaker(bind=engine)
 
 # Note: Tables are created by the migration system in migrate_database.py

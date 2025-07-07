@@ -128,7 +128,7 @@ class ServiceManager:
                         ],
                         security_opt=[
                             'seccomp=./security/seccomp-profile.json',
-                            'no-new-privileges:true'
+                            'no-new-privileges=true'
                         ],
                         cap_drop=['ALL'],
                         cap_add=['SETUID', 'SETGID'],

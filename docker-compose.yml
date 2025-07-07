@@ -80,9 +80,10 @@ services:
     volumes:
       - .:/app:ro  # Mount as read-only for security
       - ./logs:/app/logs:rw  # Allow writes only to logs directory
+      - ./data:/app/data:rw  # Allow writes for database and data files
     security_opt:
-      - seccomp:./security/seccomp-profile.json
-      - no-new-privileges:true
+      - seccomp=./security/seccomp-profile.json
+      - no-new-privileges=true
     cap_drop:
       - ALL
     cap_add:
