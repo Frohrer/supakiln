@@ -42,7 +42,7 @@ class TestContainerSecurityConfiguration(unittest.TestCase):
                 
                 # Check if running as non-root user
                 config_user = config.get('Config', {}).get('User', '')
-                self.assertNotEqual(config_user, 'root', "Container should not run as root")
+                self.assertTrue(config_user in ['1000:1000', 'codeuser'], "Container should run as non-root user")
                 
                 # Check network mode
                 network_mode = host_config.get('NetworkMode', '')
@@ -52,14 +52,41 @@ class TestContainerSecurityConfiguration(unittest.TestCase):
                 privileged = host_config.get('Privileged', False)
                 self.assertFalse(privileged, "Container should not run in privileged mode")
                 
+                # Check security options
+                security_opt = host_config.get('SecurityOpt', [])
+                has_seccomp = any('seccomp' in opt for opt in security_opt)
+                has_apparmor = any('apparmor' in opt for opt in security_opt)
+                has_no_new_privs = any('no-new-privileges' in opt for opt in security_opt)
+                
+                self.assertTrue(has_seccomp, "Container should have seccomp profile")
+                self.assertTrue(has_apparmor, "Container should have AppArmor profile") 
+                self.assertTrue(has_no_new_privs, "Container should have no-new-privileges")
+                
                 # Check capabilities
                 cap_add = host_config.get('CapAdd', [])
                 cap_drop = host_config.get('CapDrop', [])
                 
+                # Should drop ALL capabilities
+                self.assertIn('ALL', cap_drop, "Container should drop ALL capabilities")
+                
+                # Should only add minimal required capabilities
+                allowed_caps = ['SETUID', 'SETGID']
+                for cap in cap_add:
+                    self.assertIn(cap, allowed_caps, f"Only minimal capabilities should be added, found: {cap}")
+                
                 # Should not have dangerous capabilities
-                dangerous_caps = ['SYS_ADMIN', 'SYS_PTRACE', 'SYS_MODULE', 'DAC_OVERRIDE', 'NET_ADMIN']
+                dangerous_caps = ['SYS_ADMIN', 'SYS_PTRACE', 'SYS_MODULE', 'DAC_OVERRIDE', 'NET_ADMIN', 'NET_BIND_SERVICE']
                 for cap in dangerous_caps:
                     self.assertNotIn(cap, cap_add, f"Dangerous capability {cap} should not be added")
+                    
+                # Check read-only filesystem
+                read_only = host_config.get('ReadonlyRootfs', False)
+                self.assertTrue(read_only, "Container should use read-only root filesystem")
+                
+                # Check process limits
+                pids_limit = host_config.get('PidsLimit', 0)
+                self.assertGreater(pids_limit, 0, "Container should have process limits")
+                self.assertLessEqual(pids_limit, 100, "Process limit should be reasonable")
                     
             except Exception as e:
                 self.fail(f"Failed to inspect container: {e}")

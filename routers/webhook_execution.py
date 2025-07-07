@@ -131,9 +131,27 @@ print(json.dumps(response_data))
                     image_tag,
                     detach=True,
                     tty=True,
-                    mem_limit="512m",
+                    mem_limit="256m",
                     cpu_period=100000,
-                    cpu_quota=50000
+                    cpu_quota=25000,  # 0.25 CPU
+                    pids_limit=50,
+                    ulimits=[
+                        docker.types.Ulimit(name='nofile', soft=512, hard=512),
+                        docker.types.Ulimit(name='nproc', soft=25, hard=25)
+                    ],
+                    security_opt=[
+                        'seccomp=./security/seccomp-profile.json',
+                        'apparmor=docker-security-profile',
+                        'no-new-privileges:true'
+                    ],
+                    cap_drop=['ALL'],
+                    cap_add=['SETUID', 'SETGID'],
+                    read_only=True,
+                    tmpfs={
+                        '/tmp': 'rw,noexec,nosuid,size=100m',
+                        '/var/tmp': 'rw,noexec,nosuid,size=50m'
+                    },
+                    user='1000:1000'
                 )
                 executor.containers[package_hash] = container.id
             

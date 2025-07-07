@@ -320,8 +320,21 @@ USER codeuser
                 "docker", "run",
                 "-d",
                 "-p", port_mapping,
-                "--memory", "512m",
-                "--cpus", "0.5"
+                "--memory", "256m",
+                "--cpus", "0.25",
+                "--pids-limit", "50",
+                "--ulimit", "nofile=512:512",
+                "--ulimit", "nproc=25:25",
+                "--security-opt", "seccomp=./security/seccomp-profile.json",
+                "--security-opt", "apparmor=docker-security-profile",
+                "--security-opt", "no-new-privileges:true",
+                "--cap-drop", "ALL",
+                "--cap-add", "SETUID",
+                "--cap-add", "SETGID",
+                "--read-only",
+                "--tmpfs", "/tmp:rw,noexec,nosuid,size=100m",
+                "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=50m",
+                "--user", "1000:1000"
             ] + network_options + [
                 image_tag,
                 "tail", "-f", "/dev/null"
@@ -602,8 +615,21 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                 success, output, error = self._run_docker_command([
                     "docker", "run",
                     "-d",
-                    "--memory", "512m",
-                    "--cpus", "0.5",
+                    "--memory", "256m",
+                    "--cpus", "0.25",
+                    "--pids-limit", "50",
+                    "--ulimit", "nofile=512:512",
+                    "--ulimit", "nproc=25:25",
+                    "--security-opt", "seccomp=./security/seccomp-profile.json",
+                    "--security-opt", "apparmor=docker-security-profile",
+                    "--security-opt", "no-new-privileges:true",
+                    "--cap-drop", "ALL",
+                    "--cap-add", "SETUID",
+                    "--cap-add", "SETGID",
+                    "--read-only",
+                    "--tmpfs", "/tmp:rw,noexec,nosuid,size=100m",
+                    "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=50m",
+                    "--user", "1000:1000",
                     "--network", "bridge",  # Use bridge network for regular containers
                     image_tag,
                     "tail", "-f", "/dev/null"
