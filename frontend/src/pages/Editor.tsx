@@ -25,35 +25,22 @@ const appTemplates = {
     packages: [],
     code: '# Write your Python code here\nprint("Hello, World!")'
   },
-  streamlit: {
-    name: 'Streamlit App',
-    packages: ['streamlit'],
-    code: `import streamlit as st
-import pandas as pd
-import numpy as np
+  gradio: {
+    name: 'Gradio App',
+    packages: ['gradio'],
+    code: `import gradio as gr
 
-def main():
-    st.title("My Streamlit App")
-    st.write("Hello from Streamlit!")
+def greet(name):
+    return f"Hello, {name}!"
 
-    # Add some interactive elements
-    name = st.text_input("Enter your name:")
-    if name:
-        st.write(f"Hello, {name}!")
-
-    if st.button("Click me!"):
-        st.success("Button clicked!")
-
-    # Add some data visualization
-    chart_data = pd.DataFrame(
-        np.random.randn(20, 3),
-        columns=['a', 'b', 'c']
-    )
-
-    st.line_chart(chart_data)
+with gr.Blocks() as demo:
+    inp = gr.Textbox(label="Your name")
+    out = gr.Textbox(label="Greeting")
+    btn = gr.Button("Greet")
+    btn.click(fn=greet, inputs=inp, outputs=out)
 
 if __name__ == "__main__":
-    main()
+    demo.launch(server_name="0.0.0.0", server_port=7860)
 `
   },
   fastapi: {

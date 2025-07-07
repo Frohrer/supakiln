@@ -15,13 +15,11 @@ from .base import (
     get_httpx_client_config, build_target_urls, is_websocket_request,
     is_websocket_response, prepare_response_headers, check_service_availability
 )
-from .streamlit_handler import StreamlitProxyHandler
 from .web_framework_handler import FastAPIProxyHandler, FlaskProxyHandler, DashProxyHandler, GenericWebProxyHandler
 
 
 # Handler registry
 _handlers = {
-    'streamlit': StreamlitProxyHandler(),
     'fastapi': FastAPIProxyHandler(),
     'flask': FlaskProxyHandler(),
     'dash': DashProxyHandler(),
@@ -58,14 +56,13 @@ async def proxy_websocket(websocket: WebSocket, container_id: str, path: str):
     # Get the target path using the handler
     target_path, alternative_path = handler.get_websocket_path(path, container_id)
     
-    # Build target WebSocket URL
-    docker_host = "docker-daemon"  # Use Docker Compose service name
-    target_ws_url = f"ws://{docker_host}:{service_info['external_port']}{target_path}"
+    # Build target WebSocket URLs for all Docker hosts
+    from .base import get_docker_hosts
+    docker_hosts = get_docker_hosts()
     
     print(f"🛣️  WebSocket path handling for {service_info['type']}: {path} -> {target_path}")
-    print(f"🔗 Target WebSocket URL: {target_ws_url}")
     print(f"📍 Service details: {service_info}")
-    print(f"🔌 WebSocket proxy: {websocket.url} -> {target_ws_url}")
+    print(f"🔌 WebSocket proxy: {websocket.url}")
     print(f"📦 Container: {full_container_id[:12]} ({service_info['type']})")
     
     # Accept the client WebSocket connection
@@ -83,12 +80,23 @@ async def proxy_websocket(websocket: WebSocket, container_id: str, path: str):
             await websocket.close(code=1011, reason="Target service unavailable")
             return
         
-        # Try to connect with different URL approaches but with limited attempts
-        connection_attempts = [target_ws_url]
-        if alternative_path:
-            alternative_ws_url = f"ws://{docker_host}:{service_info['external_port']}{alternative_path}"
-            connection_attempts.append(alternative_ws_url)
-            print(f"🔗 Alternative WebSocket URL: {alternative_ws_url}")
+        # Build all possible WebSocket URLs
+        connection_attempts = []
+        
+        # Extract query string from client WebSocket URL
+        query_string = ('?' + websocket.url.query) if websocket.url.query else ''
+        
+        # Try each Docker host
+        for host in docker_hosts:
+            primary_ws_url = f"ws://{host}:{service_info['external_port']}{target_path}{query_string}"
+            connection_attempts.append(primary_ws_url)
+            
+            # Also try alternative path if available
+            if alternative_path:
+                alternative_ws_url = f"ws://{host}:{service_info['external_port']}{alternative_path}{query_string}"
+                connection_attempts.append(alternative_ws_url)
+        
+        print(f"🔗 WebSocket connection attempts: {connection_attempts}")
         
         target_ws = None
         successful_url = None
@@ -97,7 +105,7 @@ async def proxy_websocket(websocket: WebSocket, container_id: str, path: str):
             try:
                 print(f"🔄 Attempt {attempt_num + 1}: Connecting to {ws_url}")
                 
-                # Use more lenient connection parameters with shorter timeout for quicker failure
+                # Use more stable connection parameters
                 target_ws = await websockets.connect(
                     ws_url,
                     extra_headers={
@@ -108,12 +116,12 @@ async def proxy_websocket(websocket: WebSocket, container_id: str, path: str):
                         'X-Forwarded-Proto': 'http',
                         'User-Agent': 'Supakiln-WebSocket-Proxy/1.0',
                     },
-                    timeout=10,  # Shorter timeout for quicker failure detection
-                    max_size=2**23,  # 8MB max message size (increased for large data)
-                    ping_interval=30,  # Increased ping interval
-                    ping_timeout=20,  # Increased ping timeout
+                    timeout=20,  # Increased timeout for better stability
+                    max_size=2**24,  # 16MB max message size
+                    ping_interval=60,  # Longer ping interval to reduce overhead
+                    ping_timeout=30,  # Longer ping timeout
                     compression=None,  # Disable compression to avoid issues
-                    close_timeout=5  # Shorter close timeout
+                    close_timeout=10  # Longer close timeout
                 )
                 successful_url = ws_url
                 print(f"✅ WebSocket connection established to {ws_url}")
@@ -122,8 +130,8 @@ async def proxy_websocket(websocket: WebSocket, container_id: str, path: str):
             except Exception as conn_error:
                 print(f"❌ Failed to connect to {ws_url}: {conn_error}")
                 if attempt_num < len(connection_attempts) - 1:
-                    print(f"🔄 Trying next URL in 1 second...")
-                    await asyncio.sleep(1)  # Add delay between attempts
+                    print(f"🔄 Trying next URL in 0.5 seconds...")
+                    await asyncio.sleep(0.5)  # Shorter delay between attempts
                     continue
                 else:
                     # All attempts failed
@@ -146,7 +154,7 @@ async def proxy_websocket(websocket: WebSocket, container_id: str, path: str):
                     while True:
                         # Receive from client WebSocket (handle both text and binary)
                         try:
-                            data = await websocket.receive()
+                            data = await asyncio.wait_for(websocket.receive(), timeout=30.0)
                             if 'text' in data:
                                 message = data['text']
                                 await target_ws.send(message)
@@ -155,19 +163,28 @@ async def proxy_websocket(websocket: WebSocket, container_id: str, path: str):
                                 message = data['bytes']
                                 await target_ws.send(message)
                                 print(f"📤 Client -> Target (binary): {len(message)} bytes")
+                            elif data.get('type') == 'websocket.disconnect':
+                                print("🔌 Client disconnected")
+                                break
+                        except asyncio.TimeoutError:
+                            # No message received within timeout, continue
+                            continue
+                        except (ConnectionClosed, WebSocketException) as e:
+                            print(f"🔌 Client connection closed: {e}")
+                            break
                         except Exception as recv_error:
                             print(f"❌ Error receiving from client: {recv_error}")
                             break
                 except Exception as e:
                     print(f"❌ Client->Target error: {e}")
-                    raise
+                    return
             
             async def target_to_client():
                 try:
                     while True:
                         # Receive from target WebSocket
                         try:
-                            message = await target_ws.recv()
+                            message = await asyncio.wait_for(target_ws.recv(), timeout=30.0)
                             # Check if message is text or binary
                             if isinstance(message, str):
                                 await websocket.send_text(message)
@@ -175,12 +192,18 @@ async def proxy_websocket(websocket: WebSocket, container_id: str, path: str):
                             else:
                                 await websocket.send_bytes(message)
                                 print(f"📥 Target -> Client (binary): {len(message)} bytes")
+                        except asyncio.TimeoutError:
+                            # No message received within timeout, continue
+                            continue
+                        except (ConnectionClosed, WebSocketException) as e:
+                            print(f"🔌 Target connection closed: {e}")
+                            break
                         except Exception as recv_error:
                             print(f"❌ Error receiving from target: {recv_error}")
                             break
                 except Exception as e:
                     print(f"❌ Target->Client error: {e}")
-                    raise
+                    return
             
             # Run both directions concurrently
             try:
@@ -256,8 +279,10 @@ async def proxy_request(request: Request, container_id: str) -> Response:
     
     # Check if we have a rewritten path from static asset fallback routing
     if hasattr(request.state, 'rewritten_path'):
-        remaining_path = request.state.rewritten_path
-        print(f"🔄 Using rewritten path for static asset: {remaining_path}")
+        rewritten_path = request.state.rewritten_path
+        print(f"🔄 Using rewritten path for static asset: {rewritten_path}")
+        # Still need to use the handler to transform the rewritten path
+        remaining_path = handler.get_target_path(rewritten_path, container_id)
     else:
         # Use the handler to transform the path
         remaining_path = handler.get_target_path(full_path, container_id)
