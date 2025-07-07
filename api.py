@@ -63,12 +63,14 @@ async def startup_event():
     max_retries = 5
     retry_delay = 2
     
+    migration_success = False
     for attempt in range(max_retries):
         try:
             print(f"Running database migration (attempt {attempt + 1}/{max_retries})...")
             from migrate_database import migrate_database
             migrate_database()
             print("✅ Database migration completed successfully")
+            migration_success = True
             break
         except Exception as e:
             print(f"❌ Database migration failed (attempt {attempt + 1}/{max_retries}): {e}")
@@ -77,8 +79,14 @@ async def startup_event():
                 time.sleep(retry_delay)
                 retry_delay *= 1.5  # Exponential backoff
             else:
-                print("💥 Failed to migrate database after all retries. Application may not function correctly.")
-                # Don't exit the app, just log the error
+                print("💥 Failed to migrate database after all retries. Application cannot start.")
+                print("This is a critical error - the application requires a proper database schema.")
+                # Exit the application if migration fails
+                sys.exit(1)
+    
+    if not migration_success:
+        print("💥 Database migration failed. Application cannot start safely.")
+        sys.exit(1)
                 
     # Auto-start services marked for auto-start
     try:
