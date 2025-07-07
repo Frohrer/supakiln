@@ -10,7 +10,14 @@ class JobScheduler:
         self.scheduler = AsyncIOScheduler()
         self.executor = CodeExecutor()
         self.scheduler.start()
-        self.load_existing_jobs()
+        self._initialized = False
+        # Don't load existing jobs immediately - wait for explicit initialization
+        
+    def initialize(self):
+        """Initialize the scheduler after database migration is complete."""
+        if not self._initialized:
+            self.load_existing_jobs()
+            self._initialized = True
 
     def load_existing_jobs(self):
         """Load all active jobs from the database and schedule them."""
