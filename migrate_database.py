@@ -8,7 +8,8 @@ import os
 from datetime import datetime
 
 def migrate_database():
-    db_path = "code_executor.db"
+    # Use same path logic as main database configuration
+    db_path = '/app/data/code_executor.db' if os.path.exists('/app/data') else 'code_executor.db'
     
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
