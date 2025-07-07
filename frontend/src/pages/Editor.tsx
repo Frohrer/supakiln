@@ -23,7 +23,30 @@ const appTemplates = {
   basic: {
     name: 'Basic Python',
     packages: [],
-    code: '# Write your Python code here\nprint("Hello, World!")'
+    code: `# Write your Python code here
+import os
+
+# Example 1: Get environment variable with default value
+database_url = os.getenv('DATABASE_URL', 'sqlite:///default.db')
+print(f"Database URL: {database_url}")
+
+# Example 2: Get required environment variable (raises error if not found)
+try:
+    api_key = os.environ['API_KEY']
+    print(f"API Key found: {api_key[:8]}...")
+except KeyError:
+    print("API_KEY environment variable not set")
+
+# Example 3: Get environment variable with type conversion
+debug_mode = os.getenv('DEBUG', 'false').lower() == 'true'
+print(f"Debug mode: {debug_mode}")
+
+# Example 4: List all environment variables
+print("\\nAll environment variables:")
+for key, value in os.environ.items():
+    print(f"{key}: {value}")
+
+print("Hello, World!")`
   },
   gradio: {
     name: 'Gradio App',
@@ -193,7 +216,17 @@ const CodeEditor: React.FC = () => {
 
   useEffect(() => {
     loadCodeSessions();
+    // Load auto-saved editor state on mount
+    loadAutoSavedState();
   }, []);
+
+  // Auto-save current editor state to localStorage
+  useEffect(() => {
+    // Only auto-save if not currently loading a template or session
+    if (code && code !== appTemplates.basic.code) {
+      saveAutoSavedState();
+    }
+  }, [code, packages]);
 
   // Load saved code sessions from localStorage
   const loadCodeSessions = () => {
@@ -204,6 +237,47 @@ const CodeEditor: React.FC = () => {
       }
     } catch (error) {
       console.error('Error loading code sessions:', error);
+    }
+  };
+
+  // Load auto-saved editor state
+  const loadAutoSavedState = () => {
+    try {
+      const autoSaved = localStorage.getItem('currentEditorState');
+      if (autoSaved) {
+        const { code: savedCode, packages: savedPackages, timestamp } = JSON.parse(autoSaved);
+        // Only load if saved within last 24 hours and not empty
+        const dayAgo = Date.now() - (24 * 60 * 60 * 1000);
+        if (timestamp > dayAgo && savedCode && savedCode.trim() !== '') {
+          setCode(savedCode);
+          setPackages(savedPackages.length > 0 ? savedPackages : ['']);
+        }
+      }
+    } catch (error) {
+      console.error('Error loading auto-saved state:', error);
+    }
+  };
+
+  // Save current editor state automatically
+  const saveAutoSavedState = () => {
+    try {
+      const autoSaveData = {
+        code,
+        packages: packages.filter((p: string) => p.trim() !== ''),
+        timestamp: Date.now()
+      };
+      localStorage.setItem('currentEditorState', JSON.stringify(autoSaveData));
+    } catch (error) {
+      console.error('Error auto-saving editor state:', error);
+    }
+  };
+
+  // Clear auto-saved state
+  const clearAutoSavedState = () => {
+    try {
+      localStorage.removeItem('currentEditorState');
+    } catch (error) {
+      console.error('Error clearing auto-saved state:', error);
     }
   };
 
@@ -225,6 +299,8 @@ const CodeEditor: React.FC = () => {
     setWebService(null);
     setCurrentSessionId(null);
     setSelectedSession('');
+    // Clear auto-saved state when loading a template
+    clearAutoSavedState();
   };
 
   const handleSessionLoad = (sessionId: string) => {
@@ -236,6 +312,8 @@ const CodeEditor: React.FC = () => {
       setCurrentSessionId(sessionId);
       setSelectedTemplate(''); // Clear template selection
       setWebService(null);
+      // Clear auto-saved state when loading a session
+      clearAutoSavedState();
     }
   };
 
