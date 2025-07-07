@@ -12,6 +12,23 @@ services:
         - VITE_CF_ACCESS_TOKEN=${VITE_CF_ACCESS_TOKEN}
     ports:
       - "3000:3000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+      - /var/tmp:noexec,nosuid,size=100m
+      - /var/cache:noexec,nosuid,size=50m
+    ulimits:
+      nproc: 50
+      nofile:
+        soft: 512
+        hard: 512
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 50
     environment:
       - VITE_FRONTEND_URL=${VITE_FRONTEND_URL}
       - VITE_API_URL=${VITE_API_URL}
@@ -25,10 +42,36 @@ services:
 
   docker-daemon:
     image: docker:dind
-    privileged: true
+    privileged: false
+    security_opt:
+      - seccomp:./security/seccomp-profile.json
+      - apparmor:docker-security-profile
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+      - CHOWN
+      - SETFCAP
+      - NET_BIND_SERVICE
+    read_only: false  # Docker daemon needs write access to its directories
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+      - /var/tmp:noexec,nosuid,size=100m
+    ulimits:
+      nproc: 100
+      nofile:
+        soft: 1024
+        hard: 1024
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 200
     environment:
       - DOCKER_TLS_CERTDIR=""  # Disable TLS for simplicity
-    command: ["dockerd", "--host=tcp://0.0.0.0:2376", "--host=unix:///var/run/docker.sock"]
+    command: ["dockerd", "--host=tcp://0.0.0.0:2376", "--host=unix:///var/run/docker.sock", "--default-ulimit", "nofile=1024:1024", "--default-ulimit", "nproc=50:50"]
     healthcheck:
       test: ["CMD", "docker", "info"]
       interval: 5s
@@ -43,7 +86,29 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/app
+      - .:/app:ro  # Mount as read-only for security
+      - /app/logs:/app/logs:rw  # Allow writes only to logs directory
+    security_opt:
+      - seccomp:./security/seccomp-profile.json
+      - apparmor:docker-security-profile
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    read_only: false  # Backend needs some write access for logs and temp files
+    tmpfs:
+      - /tmp:noexec,nosuid,size=200m
+      - /var/tmp:noexec,nosuid,size=100m
+    ulimits:
+      nproc: 100
+      nofile:
+        soft: 1024
+        hard: 1024
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 100
     environment:
       - DOCKER_HOST=tcp://docker-daemon:2376
       - BACKEND_URL=${BACKEND_URL}

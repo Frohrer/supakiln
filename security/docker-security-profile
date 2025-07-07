@@ -1,0 +1,112 @@
+#include <tunables/global>
+
+profile docker-security-profile flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Deny dangerous capabilities
+  deny capability sys_admin,
+  deny capability sys_ptrace,
+  deny capability sys_module,
+  deny capability dac_override,
+  deny capability dac_read_search,
+  deny capability net_admin,
+  deny capability net_bind_service,
+  deny capability sys_chroot,
+  deny capability sys_boot,
+  deny capability sys_time,
+
+  # Allow basic file access patterns
+  /tmp/** rw,
+  /var/tmp/** rw,
+  /usr/bin/** ix,
+  /usr/lib/** mr,
+  /lib/** mr,
+  /lib64/** mr,
+  /etc/passwd r,
+  /etc/group r,
+  /etc/nsswitch.conf r,
+  /etc/ld.so.cache r,
+  /etc/ld.so.conf r,
+  /etc/ld.so.conf.d/ r,
+  /etc/ld.so.conf.d/** r,
+
+  # Allow Python and package access
+  /usr/local/bin/python* ix,
+  /usr/local/lib/python*/** mr,
+  /usr/local/lib/python*/** w,
+
+  # Allow home directory for non-root user
+  /home/codeuser/** rw,
+  owner /home/codeuser/** rw,
+
+  # Deny sensitive file access
+  deny /etc/shadow r,
+  deny /etc/sudoers r,
+  deny /etc/passwd w,
+  deny /etc/group w,
+  deny /root/** rw,
+  deny /boot/** rw,
+  deny /sys/** rw,
+  deny /proc/sys/** rw,
+  deny /proc/*/mem rw,
+  deny /proc/kcore rw,
+  deny /proc/kmem rw,
+  deny /dev/mem rw,
+  deny /dev/kmem rw,
+  deny /dev/port rw,
+  deny /var/run/docker.sock rw,
+
+  # Block access to dangerous /proc paths
+  deny /proc/1/root/** rw,
+  deny /proc/self/root/** rw,
+  deny /proc/*/root/** rw,
+  deny /proc/sys/kernel/core_pattern rw,
+  deny /proc/sysrq-trigger rw,
+
+  # Allow limited /proc access for normal operations
+  /proc/self/environ r,
+  /proc/self/fd/ r,
+  /proc/self/fd/** r,
+  /proc/self/status r,
+  /proc/self/cmdline r,
+  /proc/meminfo r,
+  /proc/cpuinfo r,
+  /proc/version r,
+  /proc/uptime r,
+  /proc/loadavg r,
+
+  # Network restrictions
+  deny network inet raw,
+  deny network inet6 raw,
+  deny network packet,
+  deny network netlink,
+  
+  # Allow basic networking for applications
+  network inet stream,
+  network inet dgram,
+  network inet6 stream,
+  network inet6 dgram,
+
+  # Signal restrictions
+  deny signal send set=(kill,term) peer=unconfined,
+  
+  # Mount restrictions
+  deny mount,
+  deny umount,
+
+  # Ptrace restrictions
+  deny ptrace,
+  deny ptrace read,
+  deny ptrace write,
+
+  # Capability restrictions for container isolation
+  deny capability setpcap,
+  deny capability fsetid,
+  deny capability kill,
+  deny capability fowner,
+  deny capability chown,
+
+  # Allow only basic capabilities needed for Python execution
+  capability setuid,
+  capability setgid,
+} 
