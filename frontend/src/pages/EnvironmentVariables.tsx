@@ -44,7 +44,7 @@ export default function EnvironmentVariables() {
 
   const fetchVariables = async () => {
     try {
-      const response = await api.get<EnvVarMetadata[]>('/env-metadata');
+      const response = await api.get<EnvVarMetadata[]>('/env/metadata');
       setVariables(response.data);
     } catch (err) {
       console.error('Error fetching variables:', err);
