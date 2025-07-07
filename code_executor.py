@@ -73,6 +73,7 @@ class CodeExecutor:
         hash_obj = hashlib.md5(package_str.encode())
         return hash_obj.hexdigest()[:12]
     
+
     def _allocate_port(self) -> int:
         """Allocate a random available port between 9000-9999."""
         for _ in range(100):  # Try up to 100 times
@@ -283,7 +284,82 @@ USER codeuser
         
         return success and not timed_out, combined_output, combined_error, timed_out
     
-    def execute_code(self, code: str, packages: List[str], timeout: int = 30) -> Dict:
+    def _execute_with_streaming_timeout_and_env(self, container_id: str, encoded_code: str, timeout: int, env_vars: Dict[str, str]) -> Tuple[bool, str, Optional[str], bool]:
+        """Execute code in a container with environment variables injected at execution time."""
+        import threading
+        import docker
+        
+        output_buffer = []
+        error_buffer = []
+        success = False
+        timed_out = False
+        
+        def collect_output():
+            nonlocal success, timed_out
+            try:
+                container = docker_client.containers.get(container_id)
+                # Execute with environment variables injected at execution time
+                result = container.exec_run(
+                    f"python3 -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
+                    environment=env_vars,  # Inject environment variables here
+                    stream=False,  # Don't stream to get proper exit code
+                    demux=True     # Separate stdout and stderr
+                )
+                
+                # Process the output
+                if result.output:
+                    stdout_data, stderr_data = result.output
+                    if stdout_data:
+                        output_buffer.append(stdout_data.decode('utf-8', errors='replace'))
+                    if stderr_data:
+                        error_buffer.append(stderr_data.decode('utf-8', errors='replace'))
+                
+                # Check the exit code
+                success = result.exit_code == 0
+                
+            except Exception as e:
+                error_buffer.append(f"Execution error: {str(e)}")
+                success = False
+        
+        # Start output collection in a separate thread
+        output_thread = threading.Thread(target=collect_output)
+        output_thread.daemon = True
+        output_thread.start()
+        
+        # Wait for completion or timeout
+        output_thread.join(timeout)
+        
+        if output_thread.is_alive():
+            # Thread is still running, so we timed out
+            timed_out = True
+            # Try to stop the execution in the container
+            try:
+                container = docker_client.containers.get(container_id)
+                # Kill the process in the container
+                container.exec_run("pkill -f python", detach=True)
+            except:
+                pass
+            
+            # Give it a moment to clean up
+            output_thread.join(1)
+        
+        # Combine output
+        combined_output = ''.join(output_buffer) if output_buffer else None
+        combined_error = ''.join(error_buffer) if error_buffer else None
+        
+        # If we timed out, add timeout message
+        if timed_out:
+            timeout_msg = f"\n--- Execution timed out after {timeout} seconds ---"
+            if combined_output:
+                combined_output += timeout_msg
+            elif combined_error:
+                combined_error += timeout_msg
+            else:
+                combined_error = f"Execution timed out after {timeout} seconds"
+        
+        return success and not timed_out, combined_output, combined_error, timed_out
+    
+    def execute_code(self, code: str, packages: List[str], timeout: int = 30, env_vars: Dict[str, str] = None) -> Dict:
         """
         Execute Python code in a container with the specified packages.
         
@@ -291,10 +367,14 @@ USER codeuser
             code: Python code to execute
             packages: List of required Python packages
             timeout: Maximum execution time in seconds
+            env_vars: Dictionary of environment variables to pass to the container
             
         Returns:
             Dict containing execution results
         """
+        if env_vars is None:
+            env_vars = {}
+            
         package_hash = self._get_package_hash(packages)
         
         # Detect if this is a web service
@@ -316,13 +396,18 @@ USER codeuser
             
             # Note: Web services will be accessible via Docker host port mapping
             
+            # Build environment variable options for docker run
+            env_options = []
+            for key, value in env_vars.items():
+                env_options.extend(["-e", f"{key}={value}"])
+            
             success, output, error = self._run_docker_command([
                 "docker", "run",
                 "-d",
                 "-p", port_mapping,
                 "--memory", "512m",
                 "--cpus", "0.5"
-            ] + network_options + [
+            ] + network_options + env_options + [
                 image_tag,
                 "tail", "-f", "/dev/null"
             ])
@@ -598,13 +683,14 @@ export PYTHONPATH=/tmp:$PYTHONPATH
             if package_hash not in self.containers:
                 image_tag = self._build_image(packages)
                 
-                # Regular container for non-web services
+                # Regular container for non-web services (no environment variables at creation)
                 success, output, error = self._run_docker_command([
                     "docker", "run",
                     "-d",
                     "--memory", "512m",
                     "--cpus", "0.5",
-                    "--network", "bridge",  # Use bridge network for regular containers
+                    "--network", "bridge"  # Use bridge network for regular containers
+                ] + [
                     image_tag,
                     "tail", "-f", "/dev/null"
                 ])
@@ -619,10 +705,9 @@ export PYTHONPATH=/tmp:$PYTHONPATH
             
             container_id = self.containers[package_hash]
             
-            # Regular code execution
+            # Regular code execution with environment variables injected at execution time
             encoded_code = base64.b64encode(code.encode()).decode()
-            exec_command = f"echo '{encoded_code}' | base64 -d | python3"
-            success, output, error, timed_out = self._execute_with_streaming_timeout(container_id, exec_command, timeout)
+            success, output, error, timed_out = self._execute_with_streaming_timeout_and_env(container_id, encoded_code, timeout, env_vars)
             
             return {
                 "success": success,

@@ -48,11 +48,16 @@ async def execute_web_service(request: CodeExecutionRequest, db: Session = Depen
         if not request.packages:
             request.packages = []
             
+        # Get environment variables
+        env_manager = get_env_manager()
+        env_vars = env_manager.get_all_variables()
+        
         # Use the CodeExecutor method which handles web service detection
         result = get_code_executor().execute_code(
             code=request.code,
             packages=request.packages,
-            timeout=60  # Longer timeout for web services
+            timeout=60,  # Longer timeout for web services
+            env_vars=env_vars
         )
         
         # Log the execution
@@ -231,11 +236,16 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             if not request.packages:
                 request.packages = []
             
+            # Get environment variables
+            env_manager = get_env_manager()
+            env_vars = env_manager.get_all_variables()
+            
             # Use the proper executor method
             result = get_code_executor().execute_code(
                 code=request.code,
                 packages=request.packages,
-                timeout=request.timeout or 30
+                timeout=request.timeout or 30,
+                env_vars=env_vars
             )
             
             # Log the execution
