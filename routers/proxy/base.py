@@ -72,9 +72,9 @@ class BaseProxyHandler(ABC):
 
 
 def get_executor():
-    """Get the shared executor instance from execution router."""
-    from routers.execution import executor
-    return executor
+    """Get the shared executor instance from code executor service."""
+    from services.code_executor_service import get_code_executor
+    return get_code_executor()
 
 
 def find_service_info(container_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:

@@ -8,12 +8,8 @@ import os
 
 from .proxy_handlers import proxy_request, proxy_websocket
 from .base import get_executor, find_service_info
-from .streamlit_handler import StreamlitProxyHandler
 
 router = APIRouter(tags=["proxy"])
-
-# Initialize handlers for static asset detection
-streamlit_handler = StreamlitProxyHandler()
 
 
 @router.api_route("/proxy/{container_id:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
@@ -29,7 +25,9 @@ async def handle_proxy_request(request: Request, container_id: str):
     # Check if this looks like a static asset request without container ID
     # e.g., /proxy/static/css/index.css instead of /proxy/abc123/static/css/index.css
     static_patterns = [
-        'static', '_stcore', 'favicon.ico', 'manifest.json',
+        'static', '_stcore', 'favicon.ico', 'favicon.png', 'manifest.json',
+        # Additional common static asset patterns
+        'assets', 'css', 'js', 'fonts', 'images', 'img', 'media',
         # Dash-specific patterns
         '_dash-component-suites', '_dash-layout', '_dash-dependencies', '_dash-update-component'
     ]
@@ -41,13 +39,10 @@ async def handle_proxy_request(request: Request, container_id: str):
         
         # Find the most recent web service container (prioritize by service type based on asset pattern)
         web_containers = []
-        streamlit_containers = []
         dash_containers = []
         
         for cid, info in executor.web_service_containers.items():
-            if info['type'] == 'streamlit':
-                streamlit_containers.append((cid, info))
-            elif info['type'] == 'dash':
+            if info['type'] == 'dash':
                 dash_containers.append((cid, info))
             else:
                 web_containers.append((cid, info))
@@ -55,10 +50,9 @@ async def handle_proxy_request(request: Request, container_id: str):
         # Prefer containers based on asset type
         if short_container_id.startswith('_dash-'):
             # Dash-specific assets should prefer Dash containers
-            target_containers = dash_containers + streamlit_containers + web_containers
+            target_containers = dash_containers + web_containers
         else:
-            # Other assets prefer Streamlit containers for backward compatibility
-            target_containers = streamlit_containers + dash_containers + web_containers
+            target_containers = web_containers + dash_containers
         
         if target_containers:
             # Use the most recent container

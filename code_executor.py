@@ -93,13 +93,12 @@ class CodeExecutor:
         # Allocate a dynamic internal port for this service
         internal_port = self._allocate_port()
         
-        # Streamlit detection
-        if 'streamlit' in packages or 'streamlit' in code_lower or 'st.' in code:
+        # Gradio detection
+        if 'gradio' in packages or 'gradio' in code_lower or 'import gradio' in code_lower:
             return {
-                'type': 'streamlit',
+                'type': 'gradio',
                 'internal_port': internal_port,
-                'start_command': f'cd /tmp && streamlit run app.py --server.address=0.0.0.0 --server.port={internal_port}',
-                'needs_proxy_path': True  # Flag to indicate this service needs proxy path configuration
+                'start_command': 'cd /tmp && python app.py'
             }
         
         # FastAPI detection
@@ -363,14 +362,7 @@ USER codeuser
             service_info = self.web_service_containers[container_id]
             
             print(f"🚀 Starting {service_info['type']} service in container {container_id[:8]}")
-            if service_info['type'] == 'streamlit':
-                container_short_id = container_id[:8]
-                proxy_path = f"/proxy/{container_short_id}"
-                enhanced_command = f'streamlit run app.py --server.address=0.0.0.0 --server.port={service_info["internal_port"]} --server.baseUrlPath="{proxy_path}"'
-                print(f"📝 Enhanced Command: {enhanced_command}")
-                print(f"🛣️  Proxy Path: {proxy_path}")
-            else:
-                print(f"📝 Command: {service_info['start_command']}")
+            print(f"📝 Command: {service_info['start_command']}")
             print(f"🌐 Internal port: {service_info['internal_port']} -> External port: {service_info['external_port']}")
             
             # First, validate the app.py file
@@ -383,8 +375,8 @@ USER codeuser
                 print(f"✅ App validation passed")
             
             # Check if required packages are available
-            if service_info['type'] == 'streamlit':
-                pkg_check = "python -c 'import streamlit; print(f\"Streamlit version: {streamlit.__version__}\")'"
+            if service_info['type'] == 'gradio':
+                pkg_check = "python -c 'import gradio as gr; print(f\"Gradio version: {gr.__version__}\")'"
             elif service_info['type'] == 'flask':
                 pkg_check = "python -c 'import flask; print(f\"Flask version: {flask.__version__}\")'"
             elif service_info['type'] == 'fastapi':
@@ -398,47 +390,51 @@ USER codeuser
             print(f"📦 Package check: {pkg_output if pkg_success else pkg_error}")
             
             # Start the service in background using Docker exec -d (detached)
-            if service_info['type'] == 'streamlit':
-                # Create Streamlit config without baseUrlPath - let it serve at root level
-                # We'll handle all path rewriting in the proxy layer
-                container_short_id = container_id[:8]
-                
-                streamlit_config = f'''
-[server]
-enableCORS = false
-enableXsrfProtection = false
-maxUploadSize = 200
-headless = true
-enableStaticServing = true
-enableWebsocketCompression = false
-port = {service_info["internal_port"]}
-address = "0.0.0.0"
+            if service_info['type'] == 'gradio':
+                # Create wrapper script that forces Gradio to use allocated port
+                gradio_wrapper = f'''#!/usr/bin/env python
+import os
+import sys
 
-[browser]
-gatherUsageStats = false
+# Set environment variables before importing gradio
+os.environ["GRADIO_SERVER_NAME"] = "0.0.0.0"
+os.environ["GRADIO_SERVER_PORT"] = "{service_info['internal_port']}"
 
-[global]
-unitTest = false
+# Import gradio and patch launch methods
+import gradio as gr
 
-[client]
-toolbarMode = "minimal"
+# Store original launch method
+_original_launch = gr.blocks.Blocks.launch
 
-[logger]
-level = "info"
+def patched_launch(self, *args, **kwargs):
+    # Override any user-specified server settings
+    kwargs["server_name"] = "0.0.0.0"
+    kwargs["server_port"] = {service_info['internal_port']}
+    print(f"[GradioWrapper] Forcing launch on 0.0.0.0:{service_info['internal_port']}")
+    return _original_launch(self, *args, **kwargs)
+
+# Apply patch
+gr.blocks.Blocks.launch = patched_launch
+gr.Interface.launch = patched_launch
+
+# Now run the user's app
+sys.path.insert(0, '/tmp')
+exec(open('/tmp/app.py').read())
 '''
-                config_script = f"echo '{base64.b64encode(streamlit_config.encode()).decode()}' | base64 -d > /tmp/.streamlit/config.toml"
-                
-                # Run Streamlit without baseUrlPath - serve at root level
-                basic_streamlit_command = f'cd /tmp && streamlit run app.py --server.address=0.0.0.0 --server.port={service_info["internal_port"]}'
                 
                 service_start_script = f'''#!/bin/bash
 cd /tmp
-mkdir -p .streamlit
-{config_script}
 export PYTHONPATH=/tmp:$PYTHONPATH
-export STREAMLIT_SERVER_ENABLE_STATIC_SERVING=true
-export STREAMLIT_SERVER_ENABLE_WEBSOCKET_COMPRESSION=false
-{basic_streamlit_command} > /tmp/service.log 2>&1
+export GRADIO_SERVER_NAME="0.0.0.0"
+export GRADIO_SERVER_PORT="{service_info['internal_port']}"
+
+# Create the wrapper script
+cat > /tmp/gradio_wrapper.py << 'WRAPPER_EOF'
+{gradio_wrapper}
+WRAPPER_EOF
+
+# Run the wrapper
+python /tmp/gradio_wrapper.py > /tmp/service.log 2>&1
 '''
             elif service_info['type'] == 'dash':
                 # For Dash, we need to modify the app creation to include url_base_pathname
@@ -556,7 +552,7 @@ export PYTHONPATH=/tmp:$PYTHONPATH
             log_success, log_output, _ = self._execute_with_timeout(container_id, log_check_command, 5)
             
             # Check if service is actually running by checking the process
-            process_check_command = f"ps aux | grep -E '(streamlit|uvicorn|flask|python.*start_service)' | grep -v grep || echo 'No service process found'"
+            process_check_command = f"ps aux | grep -E '(gradio|uvicorn|flask|python.*start_service)' | grep -v grep || echo 'No service process found'"
             process_success, process_output, _ = self._execute_with_timeout(container_id, process_check_command, 5)
             
             # Check if the service port is listening
