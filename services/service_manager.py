@@ -114,49 +114,13 @@ class ServiceManager:
                 image_tag = executor._build_image(packages)
                 
                 if package_hash not in executor.containers:
-                    # Use secure container options for persistent services
-                    secure_options = executor._get_secure_container_options()
-                    
-                    # Convert secure options to docker-py API format
-                    security_opts = []
-                    cap_drop = []
-                    cap_add = []
-                    ulimits = []
-                    tmpfs = {}
-                    
-                    for i in range(0, len(secure_options), 2):
-                        opt = secure_options[i]
-                        val = secure_options[i+1] if i+1 < len(secure_options) else None
-                        
-                        if opt == "--security-opt":
-                            security_opts.append(val)
-                        elif opt == "--cap-drop":
-                            cap_drop.append(val)
-                        elif opt == "--cap-add":
-                            cap_add.append(val)
-                        elif opt == "--ulimit":
-                            name, limits = val.split("=")
-                            soft, hard = limits.split(":")
-                            ulimits.append(docker.types.Ulimit(name=name, soft=int(soft), hard=int(hard)))
-                        elif opt == "--tmpfs":
-                            path, opts = val.split(":", 1)
-                            tmpfs[path] = opts
-                    
                     container = docker_client.containers.run(
                         image_tag,
                         detach=True,
                         tty=True,
                         mem_limit="512m",
                         cpu_period=100000,
-                        cpu_quota=50000,
-                        network="none",  # Network isolation for services
-                        read_only=True,
-                        tmpfs=tmpfs,
-                        security_opt=security_opts,
-                        cap_drop=cap_drop,
-                        cap_add=cap_add,
-                        ulimits=ulimits,
-                        pids_limit=100
+                        cpu_quota=50000
                     )
                     executor.containers[package_hash] = container.id
                 

@@ -283,55 +283,6 @@ USER codeuser
         
         return success and not timed_out, combined_output, combined_error, timed_out
     
-    def _get_secure_container_options(self, port_mapping: Optional[str] = None) -> List[str]:
-        """
-        Generate secure Docker run options for user code execution containers.
-        
-        These security restrictions prevent container escape vulnerabilities while
-        allowing normal Python code execution. Container management code (creating/deleting
-        containers) continues to use the standard Docker client with full privileges.
-        
-        Args:
-            port_mapping: Optional port mapping string like "8080:8080"
-            
-        Returns:
-            List of Docker run arguments with security restrictions
-        """
-        secure_options = [
-            # Basic resource limits
-            "--memory", "512m",
-            "--cpus", "0.5",
-            
-            # Process and file limits 
-            "--pids-limit", "100",
-            "--ulimit", "nofile=1024:1024",
-            "--ulimit", "nproc=50:50",
-            
-            # Security restrictions
-            "--security-opt", "no-new-privileges",  # Prevent privilege escalation
-            "--cap-drop", "ALL",  # Drop all capabilities
-            "--cap-add", "SETUID",  # Only add minimal required capabilities
-            "--cap-add", "SETGID",
-            
-            # Network isolation for non-web services
-            "--network", "bridge" if port_mapping else "none",
-            
-            # Read-only root filesystem with tmpfs for writable areas
-            "--read-only",
-            "--tmpfs", "/tmp:rw,size=100m,noexec",
-            "--tmpfs", "/var/tmp:rw,size=50m,noexec",
-            "--tmpfs", "/home/codeuser:rw,size=50m,noexec",
-            
-            # Mount /proc with security restrictions
-            "--security-opt", "seccomp=default",  # Use default seccomp profile for now
-        ]
-        
-        # Add port mapping if specified (for web services)
-        if port_mapping:
-            secure_options.extend(["-p", port_mapping])
-            
-        return secure_options
-    
     def execute_code(self, code: str, packages: List[str], timeout: int = 30) -> Dict:
         """
         Execute Python code in a container with the specified packages.
@@ -359,15 +310,19 @@ USER codeuser
             external_port = self._allocate_port()
             port_mapping = f"{external_port}:{web_service['internal_port']}"
             
-            print("🔒 Creating secure container for web service execution")
+            # Use bridge network since we're in Docker-in-Docker sidecar
+            network_options = ["--network", "bridge"]
             print("✅ Using bridge network (Docker-in-Docker environment)")
             
-            # Get secure container options for web services (with port mapping)
-            secure_options = self._get_secure_container_options(port_mapping)
+            # Note: Web services will be accessible via Docker host port mapping
             
             success, output, error = self._run_docker_command([
-                "docker", "run", "-d"
-            ] + secure_options + [
+                "docker", "run",
+                "-d",
+                "-p", port_mapping,
+                "--memory", "512m",
+                "--cpus", "0.5"
+            ] + network_options + [
                 image_tag,
                 "tail", "-f", "/dev/null"
             ])
@@ -643,14 +598,13 @@ export PYTHONPATH=/tmp:$PYTHONPATH
             if package_hash not in self.containers:
                 image_tag = self._build_image(packages)
                 
-                print("🔒 Creating secure container for code execution")
-                
-                # Get secure container options for regular code (no port mapping)
-                secure_options = self._get_secure_container_options()
-                
+                # Regular container for non-web services
                 success, output, error = self._run_docker_command([
-                    "docker", "run", "-d"
-                ] + secure_options + [
+                    "docker", "run",
+                    "-d",
+                    "--memory", "512m",
+                    "--cpus", "0.5",
+                    "--network", "bridge",  # Use bridge network for regular containers
                     image_tag,
                     "tail", "-f", "/dev/null"
                 ])
