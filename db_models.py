@@ -97,7 +97,14 @@ class ExecutionLog(Base):
 
 # Create database engine and session factory
 # Use data directory for writable files when in container, fallback to current dir for development
-db_path = '/app/data/code_executor.db' if os.path.exists('/app/data') else 'code_executor.db'
+if os.path.exists('/app'):  # We're in a container
+    data_dir = '/app/data'
+    db_path = '/app/data/code_executor.db'
+    # Ensure data directory exists
+    os.makedirs(data_dir, exist_ok=True)
+else:  # Development environment
+    db_path = 'code_executor.db'
+
 engine = create_engine(f'sqlite:///{db_path}')
 SessionLocal = sessionmaker(bind=engine)
 
