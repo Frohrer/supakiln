@@ -144,28 +144,28 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             def collect_output():
                 nonlocal success, timed_out
                 try:
-                    # Use stream=True to get streaming output
+                    # Execute without streaming first to get exit code properly
                     result = container.exec_run(
                         f"python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
                         environment=env_vars,
-                        stream=True,
-                        demux=True  # Separate stdout and stderr
+                        stream=False,  # Don't stream to get proper exit code
+                        demux=True    # Separate stdout and stderr
                     )
                     
-                    # Collect streaming output
-                    for stdout_chunk, stderr_chunk in result.output:
-                        if stdout_chunk:
-                            chunk_text = stdout_chunk.decode('utf-8', errors='replace')
-                            output_buffer.append(chunk_text)
-                        if stderr_chunk:
-                            chunk_text = stderr_chunk.decode('utf-8', errors='replace')
-                            error_buffer.append(chunk_text)
+                    # Process the output
+                    if result.output:
+                        stdout_data, stderr_data = result.output
+                        if stdout_data:
+                            output_buffer.append(stdout_data.decode('utf-8', errors='replace'))
+                        if stderr_data:
+                            error_buffer.append(stderr_data.decode('utf-8', errors='replace'))
                     
-                    # Check exit code
+                    # Now we can reliably check the exit code
                     success = result.exit_code == 0
                     
                 except Exception as e:
                     error_buffer.append(f"Execution error: {str(e)}")
+                    success = False
             
             # Start output collection in a separate thread
             output_thread = threading.Thread(target=collect_output)
