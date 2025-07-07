@@ -87,7 +87,15 @@ async def startup_event():
     if not migration_success:
         print("💥 Database migration failed. Application cannot start safely.")
         sys.exit(1)
-                
+    
+    # Initialize scheduler after migration is complete
+    try:
+        from scheduler import scheduler
+        scheduler.initialize()
+        print("✅ Scheduler initialized successfully")
+    except Exception as e:
+        print(f"❌ Failed to initialize scheduler: {e}")
+        
     # Auto-start services marked for auto-start
     try:
         print("🚀 Starting auto-start services...")
