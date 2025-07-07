@@ -79,7 +79,7 @@ services:
       - "8000:8000"
     volumes:
       - .:/app:ro  # Mount as read-only for security
-      - /app/logs:/app/logs:rw  # Allow writes only to logs directory
+      - ./logs:/app/logs:rw  # Allow writes only to logs directory
     security_opt:
       - seccomp:./security/seccomp-profile.json
       - no-new-privileges:true
