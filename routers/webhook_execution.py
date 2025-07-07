@@ -141,7 +141,6 @@ print(json.dumps(response_data))
                     ],
                     security_opt=[
                         'seccomp=./security/seccomp-profile.json',
-                        'apparmor=docker-security-profile',
                         'no-new-privileges:true'
                     ],
                     cap_drop=['ALL'],

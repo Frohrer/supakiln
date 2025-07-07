@@ -41,7 +41,6 @@ async def create_container(request: PackageInstallRequest):
                 ],
                 security_opt=[
                     'seccomp=./security/seccomp-profile.json',
-                    'apparmor=docker-security-profile',
                     'no-new-privileges:true'
                 ],
                 cap_drop=['ALL'],
