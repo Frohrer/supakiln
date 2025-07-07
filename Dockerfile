@@ -29,6 +29,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . .
 
+# Create data directory for database and other writable files
+RUN mkdir -p /app/data /app/logs
+
 # Set proper permissions for app directory
 RUN chown -R codeuser:codeuser /app
 

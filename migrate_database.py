@@ -9,9 +9,30 @@ from datetime import datetime
 
 def migrate_database():
     # Use same path logic as main database configuration
-    db_path = '/app/data/code_executor.db' if os.path.exists('/app/data') else 'code_executor.db'
+    if os.path.exists('/app'):  # We're in a container
+        data_dir = '/app/data'
+        db_path = '/app/data/code_executor.db'
+        # Ensure data directory exists
+        os.makedirs(data_dir, exist_ok=True)
+        print(f"📁 Using container database path: {db_path}")
+    else:  # Development environment
+        db_path = 'code_executor.db'
+        print(f"📁 Using development database path: {db_path}")
     
-    conn = sqlite3.connect(db_path)
+    # Ensure the directory exists and we can write to it
+    try:
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    except OSError:
+        pass  # Directory already exists or we don't have permissions
+    
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.OperationalError as e:
+        print(f"❌ Failed to connect to database at {db_path}: {e}")
+        print(f"🔍 Current working directory: {os.getcwd()}")
+        print(f"🔍 Directory exists: {os.path.exists(os.path.dirname(db_path))}")
+        print(f"🔍 Directory permissions: {oct(os.stat(os.path.dirname(db_path)).st_mode) if os.path.exists(os.path.dirname(db_path)) else 'N/A'}")
+        raise
     cursor = conn.cursor()
     
     try:
