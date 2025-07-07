@@ -3,8 +3,7 @@ import subprocess
 import time
 import base64
 from datetime import datetime
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+# Database imports handled through models module
 from models import PersistentService
 from services.docker_client import docker_client
 from code_executor import CodeExecutor
@@ -90,10 +89,9 @@ class ServiceManager:
     
     def _run_service(self, service_id: int, db_url: str):
         """Run a service in the background (called from thread)."""
-        # Create new database session for this thread
-        engine = create_engine(str(db_url))
-        ThreadSessionLocal = sessionmaker(bind=engine)
-        db = ThreadSessionLocal()
+        # Use the centralized database configuration instead of creating a new engine
+        from models import SessionLocal
+        db = SessionLocal()
         
         try:
             service = db.query(PersistentService).filter(PersistentService.id == service_id).first()
