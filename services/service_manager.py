@@ -3,7 +3,8 @@ import subprocess
 import time
 import base64
 from datetime import datetime
-# Database imports handled through models module
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from models import PersistentService
 from services.docker_client import docker_client
 from code_executor import CodeExecutor
@@ -89,9 +90,10 @@ class ServiceManager:
     
     def _run_service(self, service_id: int, db_url: str):
         """Run a service in the background (called from thread)."""
-        # Use the centralized database configuration instead of creating a new engine
-        from models import SessionLocal
-        db = SessionLocal()
+        # Create new database session for this thread
+        engine = create_engine(str(db_url))
+        ThreadSessionLocal = sessionmaker(bind=engine)
+        db = ThreadSessionLocal()
         
         try:
             service = db.query(PersistentService).filter(PersistentService.id == service_id).first()
@@ -112,30 +114,49 @@ class ServiceManager:
                 image_tag = executor._build_image(packages)
                 
                 if package_hash not in executor.containers:
+                    # Use secure container options for persistent services
+                    secure_options = executor._get_secure_container_options()
+                    
+                    # Convert secure options to docker-py API format
+                    security_opts = []
+                    cap_drop = []
+                    cap_add = []
+                    ulimits = []
+                    tmpfs = {}
+                    
+                    for i in range(0, len(secure_options), 2):
+                        opt = secure_options[i]
+                        val = secure_options[i+1] if i+1 < len(secure_options) else None
+                        
+                        if opt == "--security-opt":
+                            security_opts.append(val)
+                        elif opt == "--cap-drop":
+                            cap_drop.append(val)
+                        elif opt == "--cap-add":
+                            cap_add.append(val)
+                        elif opt == "--ulimit":
+                            name, limits = val.split("=")
+                            soft, hard = limits.split(":")
+                            ulimits.append(docker.types.Ulimit(name=name, soft=int(soft), hard=int(hard)))
+                        elif opt == "--tmpfs":
+                            path, opts = val.split(":", 1)
+                            tmpfs[path] = opts
+                    
                     container = docker_client.containers.run(
                         image_tag,
                         detach=True,
                         tty=True,
-                        mem_limit="256m",
+                        mem_limit="512m",
                         cpu_period=100000,
-                        cpu_quota=25000,  # 0.25 CPU
-                        pids_limit=50,
-                        ulimits=[
-                            docker.types.Ulimit(name='nofile', soft=512, hard=512),
-                            docker.types.Ulimit(name='nproc', soft=25, hard=25)
-                        ],
-                        security_opt=[
-                            'seccomp=./security/seccomp-profile.json',
-                            'no-new-privileges=true'
-                        ],
-                        cap_drop=['ALL'],
-                        cap_add=['SETUID', 'SETGID'],
+                        cpu_quota=50000,
+                        network="none",  # Network isolation for services
                         read_only=True,
-                        tmpfs={
-                            '/tmp': 'rw,noexec,nosuid,size=100m',
-                            '/var/tmp': 'rw,noexec,nosuid,size=50m'
-                        },
-                        user='1000:1000'
+                        tmpfs=tmpfs,
+                        security_opt=security_opts,
+                        cap_drop=cap_drop,
+                        cap_add=cap_add,
+                        ulimits=ulimits,
+                        pids_limit=100
                     )
                     executor.containers[package_hash] = container.id
                 

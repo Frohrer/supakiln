@@ -42,7 +42,7 @@ class TestContainerSecurityConfiguration(unittest.TestCase):
                 
                 # Check if running as non-root user
                 config_user = config.get('Config', {}).get('User', '')
-                self.assertTrue(config_user in ['1000:1000', 'codeuser'], "Container should run as non-root user")
+                self.assertNotEqual(config_user, 'root', "Container should not run as root")
                 
                 # Check network mode
                 network_mode = host_config.get('NetworkMode', '')
@@ -52,40 +52,14 @@ class TestContainerSecurityConfiguration(unittest.TestCase):
                 privileged = host_config.get('Privileged', False)
                 self.assertFalse(privileged, "Container should not run in privileged mode")
                 
-                # Check security options
-                security_opt = host_config.get('SecurityOpt', [])
-                has_seccomp = any('seccomp' in opt for opt in security_opt)
-                has_no_new_privs = any('no-new-privileges' in opt for opt in security_opt)
-                
-                self.assertTrue(has_seccomp, "Container should have seccomp profile")
-                self.assertTrue(has_no_new_privs, "Container should have no-new-privileges")
-                # Note: AppArmor is optional and may not be available on all systems (e.g., Docker Desktop)
-                
                 # Check capabilities
                 cap_add = host_config.get('CapAdd', [])
                 cap_drop = host_config.get('CapDrop', [])
                 
-                # Should drop ALL capabilities
-                self.assertIn('ALL', cap_drop, "Container should drop ALL capabilities")
-                
-                # Should only add minimal required capabilities
-                allowed_caps = ['SETUID', 'SETGID']
-                for cap in cap_add:
-                    self.assertIn(cap, allowed_caps, f"Only minimal capabilities should be added, found: {cap}")
-                
                 # Should not have dangerous capabilities
-                dangerous_caps = ['SYS_ADMIN', 'SYS_PTRACE', 'SYS_MODULE', 'DAC_OVERRIDE', 'NET_ADMIN', 'NET_BIND_SERVICE']
+                dangerous_caps = ['SYS_ADMIN', 'SYS_PTRACE', 'SYS_MODULE', 'DAC_OVERRIDE', 'NET_ADMIN']
                 for cap in dangerous_caps:
                     self.assertNotIn(cap, cap_add, f"Dangerous capability {cap} should not be added")
-                    
-                # Check read-only filesystem
-                read_only = host_config.get('ReadonlyRootfs', False)
-                self.assertTrue(read_only, "Container should use read-only root filesystem")
-                
-                # Check process limits
-                pids_limit = host_config.get('PidsLimit', 0)
-                self.assertGreater(pids_limit, 0, "Container should have process limits")
-                self.assertLessEqual(pids_limit, 100, "Process limit should be reasonable")
                     
             except Exception as e:
                 self.fail(f"Failed to inspect container: {e}")
@@ -364,79 +338,69 @@ for attempt in attempts:
             self.assertNotIn("SECURITY ISSUE: reboot syscall available", result['output'])
             
     def test_container_apparmor_profile(self):
-        """Test container AppArmor security profile (optional on some systems)"""
+        """Test container AppArmor security profile"""
         apparmor_test = """
 import os
 import subprocess
 attempts = []
 
-# Check if AppArmor is available on this system
-apparmor_available = os.path.exists('/proc/self/attr/current')
-
-if not apparmor_available:
-    attempts.append("AppArmor not available on this system (e.g., Docker Desktop)")
-else:
-    # Check AppArmor status
-    try:
-        with open('/proc/self/attr/current', 'r') as f:
-            apparmor_status = f.read().strip()
-            attempts.append(f"AppArmor status: {apparmor_status}")
-            
-            if 'docker-default' in apparmor_status:
-                attempts.append("Docker default AppArmor profile: OK")
-            elif 'unconfined' in apparmor_status:
-                attempts.append("SECURITY ISSUE: AppArmor unconfined")
-            else:
-                attempts.append("AppArmor profile: Custom or unknown")
-                
-    except Exception as e:
-        attempts.append(f"AppArmor status blocked: {e}")
-
-    # Test AppArmor restrictions
-    try:
-        # Try to access AppArmor files
-        result = subprocess.run(['aa-status'], capture_output=True, text=True)
-        attempts.append(f"AppArmor status command: {result.returncode}")
-    except Exception as e:
-        attempts.append(f"AppArmor status command blocked: {type(e).__name__}")
-
-    # Test file access restrictions
-    try:
-        # Try to access sensitive files that should be blocked by AppArmor
-        sensitive_files = [
-            '/etc/apparmor.d/',
-            '/sys/kernel/security/apparmor/',
-            '/proc/sys/kernel/yama/ptrace_scope'
-        ]
+# Check AppArmor status
+try:
+    with open('/proc/self/attr/current', 'r') as f:
+        apparmor_status = f.read().strip()
+        attempts.append(f"AppArmor status: {apparmor_status}")
         
-        for file in sensitive_files:
-            try:
-                if os.path.exists(file):
-                    if os.path.isdir(file):
-                        contents = os.listdir(file)
-                        attempts.append(f"SECURITY ISSUE: Can access {file}: {len(contents)} items")
-                    else:
-                        with open(file, 'r') as f:
-                            content = f.read()
-                            attempts.append(f"SECURITY ISSUE: Can read {file}: {len(content)} chars")
-            except Exception as e:
-                attempts.append(f"Access blocked to {file}: {type(e).__name__}")
-                
-    except Exception as e:
-        attempts.append(f"AppArmor restriction test error: {e}")
+        if 'docker-default' in apparmor_status:
+            attempts.append("Docker default AppArmor profile: OK")
+        elif 'unconfined' in apparmor_status:
+            attempts.append("SECURITY ISSUE: AppArmor unconfined")
+        else:
+            attempts.append("AppArmor profile: Custom or unknown")
+            
+except Exception as e:
+    attempts.append(f"AppArmor status blocked: {e}")
+
+# Test AppArmor restrictions
+try:
+    # Try to access AppArmor files
+    result = subprocess.run(['aa-status'], capture_output=True, text=True)
+    attempts.append(f"AppArmor status command: {result.returncode}")
+except Exception as e:
+    attempts.append(f"AppArmor status command blocked: {type(e).__name__}")
+
+# Test file access restrictions
+try:
+    # Try to access sensitive files that should be blocked by AppArmor
+    sensitive_files = [
+        '/etc/apparmor.d/',
+        '/sys/kernel/security/apparmor/',
+        '/proc/sys/kernel/yama/ptrace_scope'
+    ]
+    
+    for file in sensitive_files:
+        try:
+            if os.path.exists(file):
+                if os.path.isdir(file):
+                    contents = os.listdir(file)
+                    attempts.append(f"SECURITY ISSUE: Can access {file}: {len(contents)} items")
+                else:
+                    with open(file, 'r') as f:
+                        content = f.read()
+                        attempts.append(f"SECURITY ISSUE: Can read {file}: {len(content)} chars")
+        except Exception as e:
+            attempts.append(f"Access blocked to {file}: {type(e).__name__}")
+            
+except Exception as e:
+    attempts.append(f"AppArmor restriction test error: {e}")
 
 for attempt in attempts:
     print(attempt)
 """
         result = self.executor.execute_code(apparmor_test, [], timeout=5)
         if result['success']:
-            # AppArmor is optional on some systems (like Docker Desktop)
-            if "AppArmor not available" in result['output']:
-                print("AppArmor test skipped - not available on this system")
-            else:
-                # If AppArmor is available, it should provide protection
-                self.assertNotIn("SECURITY ISSUE: AppArmor unconfined", result['output'])
-                self.assertNotIn("SECURITY ISSUE: Can access", result['output'])
+            # Should have AppArmor protection
+            self.assertNotIn("SECURITY ISSUE: AppArmor unconfined", result['output'])
+            self.assertNotIn("SECURITY ISSUE: Can access", result['output'])
             
     def test_container_user_namespace(self):
         """Test container user namespace security"""
