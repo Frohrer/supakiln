@@ -1,5 +1,24 @@
 import axios, { AxiosResponse, AxiosError, InternalAxiosRequestConfig } from 'axios';
 
+// Type definitions for API error responses
+interface ApiErrorResponse {
+  detail?: string;
+  message?: string;
+  error?: string;
+}
+
+// Enhanced error type that includes our custom properties
+interface EnhancedError extends Error {
+  response?: {
+    data?: ApiErrorResponse | string;
+    status?: number;
+  };
+  config?: any;
+  isAxiosError?: boolean;
+  status?: number;
+  serverDetail?: string;
+}
+
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 // Cloudflare service auth configuration
@@ -58,7 +77,7 @@ api.interceptors.response.use(
   (response: AxiosResponse) => {
     return response;
   },
-  (error: AxiosError) => {
+  (error: AxiosError<ApiErrorResponse | string>) => {
     // Handle Cloudflare Access authentication errors
     if (error.response?.status === 403 && error.response?.headers?.['cf-ray']) {
       console.warn('Cloudflare Access authentication failed');
@@ -71,16 +90,16 @@ api.interceptors.response.use(
       status: error.response?.status,
       url: error.config?.url,
       method: error.config?.method?.toUpperCase(),
-      serverMessage: error.response?.data?.detail,
+      serverMessage: typeof error.response?.data === 'object' ? error.response?.data?.detail : undefined,
       fullResponse: error.response?.data,
     };
     
     console.error('API Error:', errorInfo);
     
     // Enhance the error object with better server error details
-    if (error.response?.data?.detail) {
+    if (error.response?.data && typeof error.response.data === 'object' && error.response.data.detail) {
       // Create a new error with the server's detailed message
-      const enhancedError = new Error(error.response.data.detail);
+      const enhancedError = new Error(error.response.data.detail) as EnhancedError;
       // Preserve the original error properties
       Object.assign(enhancedError, {
         response: error.response,
@@ -92,7 +111,7 @@ api.interceptors.response.use(
       return Promise.reject(enhancedError);
     } else if (error.response?.data && typeof error.response.data === 'string') {
       // Handle cases where the error is returned as a plain string
-      const enhancedError = new Error(error.response.data);
+      const enhancedError = new Error(error.response.data) as EnhancedError;
       Object.assign(enhancedError, {
         response: error.response,
         config: error.config,
@@ -131,7 +150,7 @@ api.interceptors.response.use(
           break;
       }
       
-      const enhancedError = new Error(defaultMessage);
+      const enhancedError = new Error(defaultMessage) as EnhancedError;
       Object.assign(enhancedError, {
         response: error.response,
         config: error.config,
@@ -175,31 +194,33 @@ export const makeAuthenticatedRequest = async (
 // Utility function to extract meaningful error messages from API errors
 export const extractErrorMessage = (error: any, defaultMessage: string = 'An unexpected error occurred'): string => {
   // Check if it's our enhanced axios error with serverDetail
-  if (error.serverDetail) {
+  if (error && typeof error === 'object' && 'serverDetail' in error && error.serverDetail) {
     return error.serverDetail;
   }
   
   // Check for standard axios error response structure
-  if (error.response?.data?.detail) {
+  if (error?.response?.data && typeof error.response.data === 'object' && 'detail' in error.response.data && error.response.data.detail) {
     return error.response.data.detail;
   }
   
   // Check for string response data
-  if (error.response?.data && typeof error.response.data === 'string') {
+  if (error?.response?.data && typeof error.response.data === 'string') {
     return error.response.data;
   }
   
   // Check for other common error structures
-  if (error.response?.data?.message) {
-    return error.response.data.message;
-  }
-  
-  if (error.response?.data?.error) {
-    return error.response.data.error;
+  if (error?.response?.data && typeof error.response.data === 'object') {
+    if ('message' in error.response.data && error.response.data.message) {
+      return error.response.data.message;
+    }
+    
+    if ('error' in error.response.data && error.response.data.error) {
+      return error.response.data.error;
+    }
   }
   
   // Fall back to error message
-  if (error.message) {
+  if (error?.message) {
     return error.message;
   }
   
