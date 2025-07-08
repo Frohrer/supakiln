@@ -147,15 +147,16 @@ class CodeExecutor:
         if not packages:
             return f"{self.image_name}:base"
             
-        # Create temporary Dockerfile
+        # Create temporary Dockerfile with better error handling
         dockerfile_content = f"""
 FROM {self.image_name}:base
 
 # Switch to root for package installation
 USER root
 
-# Install packages
-RUN pip install {' '.join(packages)}
+# Update pip to latest version and install packages with verbose output
+RUN pip install --upgrade pip && \\
+    pip install --no-cache-dir --verbose {' '.join(f'"{pkg}"' for pkg in packages)}
 
 # Switch back to non-root user
 USER codeuser
@@ -165,21 +166,70 @@ USER codeuser
             f.write(dockerfile_content)
         
         try:
-            # Build the image
+            # Build the image with more detailed output
             success, output, error = self._run_docker_command([
                 "docker", "build",
+                "--no-cache",  # Don't use cache to get fresh error messages
                 "-t", image_tag,
                 "-f", "Dockerfile.temp",
                 "."
-            ])
+            ], timeout=300)  # Increase timeout for package installation
+            
             if not success:
-                raise Exception(f"Failed to build image: {error}")
+                # Parse the Docker build error to extract pip installation failures
+                detailed_error = self._parse_docker_build_error(error, packages)
+                raise Exception(detailed_error)
         finally:
             # Clean up
             if os.path.exists("Dockerfile.temp"):
                 os.remove("Dockerfile.temp")
                 
         return image_tag
+    
+    def _parse_docker_build_error(self, docker_error: str, packages: List[str]) -> str:
+        """Parse Docker build error to extract meaningful package installation errors."""
+        if not docker_error:
+            return "Failed to build image: Unknown error occurred during package installation"
+        
+        # Check for common pip installation errors
+        error_lower = docker_error.lower()
+        
+        # Extract package-specific errors
+        if "could not find a version that satisfies the requirement" in error_lower:
+            # Try to extract the specific package that failed
+            for package in packages:
+                if package.lower() in error_lower:
+                    return f"Package installation failed: Package '{package}' not found or version not available. Please check the package name and try again."
+            return f"Package installation failed: One or more packages could not be found. Packages: {', '.join(packages)}"
+        
+        if "no matching distribution found" in error_lower:
+            for package in packages:
+                if package.lower() in error_lower:
+                    return f"Package installation failed: No distribution found for '{package}'. The package may not exist or may not be compatible with the Python version."
+            return f"Package installation failed: No distribution found for one or more packages: {', '.join(packages)}"
+        
+        if "error: subprocess-exited-with-error" in error_lower or "error: microsoft visual c++" in error_lower:
+            return f"Package installation failed: Compilation error occurred. One or more packages require compilation but failed to build. This may be due to missing system dependencies or incompatible packages: {', '.join(packages)}"
+        
+        if "connectionerror" in error_lower or "timeout" in error_lower or "network" in error_lower:
+            return f"Package installation failed: Network error occurred while downloading packages. Please check your internet connection and try again. Packages: {', '.join(packages)}"
+        
+        if "permission denied" in error_lower:
+            return f"Package installation failed: Permission denied during installation. This is an internal system error."
+        
+        if "disk space" in error_lower or "no space" in error_lower:
+            return f"Package installation failed: Insufficient disk space to install packages: {', '.join(packages)}"
+        
+        # Extract the last few lines of the error for more context
+        error_lines = docker_error.strip().split('\n')
+        # Get the last 5 non-empty lines
+        relevant_lines = [line.strip() for line in error_lines if line.strip()][-5:]
+        
+        if relevant_lines:
+            detailed_msg = '\n'.join(relevant_lines)
+            return f"Package installation failed for packages: {', '.join(packages)}\n\nError details:\n{detailed_msg}"
+        
+        return f"Failed to build image with packages: {', '.join(packages)}\n\nFull error: {docker_error}"
 
     def _execute_with_timeout(self, container_id: str, command: str, timeout: int) -> Tuple[bool, str, Optional[str]]:
         """Execute a command in a container with timeout."""
