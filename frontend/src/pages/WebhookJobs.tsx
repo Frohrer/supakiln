@@ -35,7 +35,7 @@ import {
   Launch as LaunchIcon,
   Code as CodeIcon,
 } from '@mui/icons-material';
-import api from '../config/api';
+import api, { extractErrorMessage } from '../config/api';
 
 interface WebhookJob {
   id: number;
@@ -186,7 +186,7 @@ const WebhookJobs: React.FC = () => {
       fetchJobs();
     } catch (error: any) {
       console.error('Error saving webhook job:', error);
-      setError(error.response?.data?.detail || 'Failed to save webhook job');
+      setError(extractErrorMessage(error));
     }
   };
 
@@ -206,7 +206,7 @@ const WebhookJobs: React.FC = () => {
       setSuccess(`Webhook test successful: ${JSON.stringify(response.data)}`);
     } catch (error: any) {
       console.error('Error testing webhook:', error);
-      setError(`Webhook test failed: ${error.response?.data?.detail || error.message}`);
+      setError(extractErrorMessage(error));
     }
   };
 

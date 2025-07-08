@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Box, Grid, Paper, Typography, Button, TextField, IconButton, Switch, FormControlLabel, MenuItem, Divider, Alert, Link, Dialog, DialogTitle, DialogContent, DialogActions } from '@mui/material';
 import { Add as AddIcon, Delete as DeleteIcon, PlayArrow as PlayIcon, Launch as LaunchIcon, Save as SaveIcon, Folder as FolderIcon } from '@mui/icons-material';
 import Editor from '@monaco-editor/react';
-import api from '../config/api';
+import api, { extractErrorMessage } from '../config/api';
 
 interface CodeSession {
   id: string;
@@ -419,7 +419,7 @@ const CodeEditor: React.FC = () => {
       const endTime = Date.now();
       const execTime = endTime - startTime;
       setExecutionTime(execTime);
-      setOutput('Error: ' + (error as Error).message);
+      setOutput('Error: ' + extractErrorMessage(error));
     } finally {
       setIsExecuting(false);
     }
