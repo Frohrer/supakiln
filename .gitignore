@@ -12,6 +12,7 @@
 .env.development
 .env.test
 .env.production
+.env_key
 
 # Dependencies
 node_modules/

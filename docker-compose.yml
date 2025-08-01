@@ -49,6 +49,8 @@ services:
       - BACKEND_URL=${BACKEND_URL}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       - ENVIRONMENT=${ENVIRONMENT:-production}
+      # Container security settings
+      - CONTAINER_NETWORK_MODE=${CONTAINER_NETWORK_MODE:-none}  # 'none' for isolation, 'bridge' for network access
     depends_on:
       docker-daemon:
         condition: service_healthy 

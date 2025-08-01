@@ -16,6 +16,11 @@ class CodeExecutor:
         self.image_name = image_name
         self.containers: Dict[str, str] = {}  # package_hash -> container_id
         self.web_service_containers: Dict[str, Dict] = {}  # container_id -> service_info
+        
+        # Network mode configuration (defaults to 'none' for security)
+        # Can be set to 'bridge' to allow network access when needed
+        self.container_network_mode = os.environ.get('CONTAINER_NETWORK_MODE', 'none')
+        print(f"🔒 Container network mode: {self.container_network_mode}")
         self._base_image_ready = False
         
     def _run_docker_command(self, command: List[str], timeout: int = 30) -> Tuple[bool, str, Optional[str]]:
@@ -95,7 +100,7 @@ class CodeExecutor:
         internal_port = self._allocate_port()
         
         # Gradio detection
-        if 'gradio' in packages or 'gradio' in code_lower or 'import gradio' in code_lower:
+        if 'gradio' in packages:
             return {
                 'type': 'gradio',
                 'internal_port': internal_port,
@@ -103,7 +108,7 @@ class CodeExecutor:
             }
         
         # FastAPI detection
-        if 'fastapi' in packages or 'uvicorn' in packages or ('fastapi' in code_lower and 'uvicorn' in code_lower):
+        if 'fastapi' in packages or 'uvicorn' in packages:
             return {
                 'type': 'fastapi', 
                 'internal_port': internal_port,
@@ -111,7 +116,7 @@ class CodeExecutor:
             }
         
         # Flask detection
-        if 'flask' in packages or 'flask' in code_lower:
+        if 'flask' in packages:
             return {
                 'type': 'flask',
                 'internal_port': internal_port, 
@@ -119,7 +124,7 @@ class CodeExecutor:
             }
         
         # Dash detection
-        if 'dash' in packages or ('dash' in code_lower and 'plotly' in packages):
+        if 'dash' in packages:
             return {
                 'type': 'dash',
                 'internal_port': internal_port,
@@ -456,7 +461,10 @@ USER codeuser
                 "-d",
                 "-p", port_mapping,
                 "--memory", "512m",
-                "--cpus", "0.5"
+                "--cpus", "0.5",
+                "--user", "1000:1000",
+                "--cap-drop", "ALL",
+                "--pids-limit", "100"  # Limit number of processes (keep reasonable limit)
             ] + network_options + env_options + [
                 image_tag,
                 "tail", "-f", "/dev/null"
@@ -739,7 +747,10 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                     "-d",
                     "--memory", "512m",
                     "--cpus", "0.5",
-                    "--network", "bridge"  # Use bridge network for regular containers
+                    "--network", self.container_network_mode,  # Configurable network mode
+                    "--user", "1000:1000",
+                    "--cap-drop", "ALL",  # Remove all capabilities
+                    "--pids-limit", "100"  # Limit number of processes (keep reasonable limit)
                 ] + [
                     image_tag,
                     "tail", "-f", "/dev/null"

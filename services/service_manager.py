@@ -10,6 +10,7 @@ from services.docker_client import docker_client
 from code_executor import CodeExecutor
 from env_manager import EnvironmentManager
 import os
+import docker
 
 class ServiceManager:
     def __init__(self):
@@ -114,13 +115,20 @@ class ServiceManager:
                 image_tag = executor._build_image(packages)
                 
                 if package_hash not in executor.containers:
+                    # Get network mode from environment variable (defaults to 'none' for security)
+                    container_network_mode = os.environ.get('CONTAINER_NETWORK_MODE', 'none')
+                    
                     container = docker_client.containers.run(
                         image_tag,
                         detach=True,
                         tty=True,
                         mem_limit="512m",
                         cpu_period=100000,
-                        cpu_quota=50000
+                        cpu_quota=50000,
+                        user="1000:1000",
+                        network_mode=container_network_mode,  # Configurable network mode
+                        cap_drop=["ALL"],  # Remove all capabilities
+                        pids_limit=100  # Limit number of processes (keep reasonable limit)
                     )
                     executor.containers[package_hash] = container.id
                 
