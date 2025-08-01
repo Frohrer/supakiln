@@ -410,7 +410,7 @@ const Logs: React.FC = () => {
       )}
 
       <Paper sx={{ p: 2, mb: 3 }}>
-        <Tabs value={tabValue} onChange={(_, newValue: number) => setTabValue(newValue)} sx={{ mb: 3 }}>
+        <Tabs value={tabValue} onChange={(_event: any, newValue: number) => setTabValue(newValue)} sx={{ mb: 3 }}>
           <Tab 
             label={
               <Box display="flex" alignItems="center" gap={1}>
@@ -520,7 +520,7 @@ const Logs: React.FC = () => {
                       </TableCell>
                       <TableCell>
                         <Typography variant="body2" fontFamily="monospace">
-                          {log.container_id ? log.container_id.slice(0, 8) : '-'}
+                          {log.container_id && typeof log.container_id === 'string' ? log.container_id.slice(0, 8) : '-'}
                         </Typography>
                       </TableCell>
                       <TableCell>

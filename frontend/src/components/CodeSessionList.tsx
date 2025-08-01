@@ -112,9 +112,9 @@ const CodeSessionList: React.FC<CodeSessionListProps> = ({ onLoadSession }) => {
                     <Typography variant="caption" color="text.secondary">
                       Updated: {new Date(session.updated_at).toLocaleDateString()}
                     </Typography>
-                    {session.packages.length > 0 && (
+                    {(session.packages || []).length > 0 && (
                       <Box sx={{ mt: 1, display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-                        {session.packages.slice(0, 3).map((pkg, index) => (
+                        {(session.packages || []).slice(0, 3).map((pkg, index) => (
                           <Chip
                             key={index}
                             label={pkg}
@@ -123,9 +123,9 @@ const CodeSessionList: React.FC<CodeSessionListProps> = ({ onLoadSession }) => {
                             sx={{ fontSize: '0.7rem', height: '20px' }}
                           />
                         ))}
-                        {session.packages.length > 3 && (
+                        {(session.packages || []).length > 3 && (
                           <Chip
-                            label={`+${session.packages.length - 3} more`}
+                            label={`+${(session.packages || []).length - 3} more`}
                             size="small"
                             variant="outlined"
                             sx={{ fontSize: '0.7rem', height: '20px' }}

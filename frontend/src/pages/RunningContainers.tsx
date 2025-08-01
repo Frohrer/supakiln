@@ -268,7 +268,7 @@ const RunningContainers: React.FC = () => {
       </Grid>
 
       <Paper sx={{ p: 2 }}>
-                 <Tabs value={tabValue} onChange={(_, newValue: number) => setTabValue(newValue)} sx={{ mb: 3 }}>
+                 <Tabs value={tabValue} onChange={(_event: any, newValue: number) => setTabValue(newValue)} sx={{ mb: 3 }}>
           <Tab label="All Containers" />
           <Tab label="Web Services" />
           <Tab label="Active Services" />
@@ -314,11 +314,11 @@ const RunningContainers: React.FC = () => {
                     </TableCell>
                     <TableCell>
                                              <Stack direction="row" spacing={0.5} flexWrap="wrap">
-                         {container.packages.slice(0, 3).map((pkg: string, index: number) => (
+                         {(container.packages || []).slice(0, 3).map((pkg: string, index: number) => (
                           <Chip key={index} label={pkg} size="small" variant="outlined" />
                         ))}
-                        {container.packages.length > 3 && (
-                          <Chip label={`+${container.packages.length - 3} more`} size="small" />
+                        {(container.packages || []).length > 3 && (
+                          <Chip label={`+${(container.packages || []).length - 3} more`} size="small" />
                         )}
                       </Stack>
                     </TableCell>
