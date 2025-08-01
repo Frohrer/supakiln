@@ -26,6 +26,7 @@ class ScheduledJobRequest(BaseModel):
     cron_expression: str
     container_id: Optional[str] = None
     packages: Optional[List[str]] = None
+    timeout: Optional[int] = 30
 
 class ScheduledJobResponse(BaseModel):
     id: int
@@ -36,6 +37,7 @@ class ScheduledJobResponse(BaseModel):
     created_at: str
     last_run: Optional[str]
     is_active: bool
+    timeout: int
 
 class ExecutionLogResponse(BaseModel):
     id: int

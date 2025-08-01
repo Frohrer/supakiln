@@ -20,7 +20,7 @@ import {
 import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
 import AddIcon from '@mui/icons-material/Add';
-import { api } from '../config/api';
+import { api, extractErrorMessage } from '../config/api';
 
 interface EnvVarMetadata {
   name: string;
@@ -44,11 +44,11 @@ export default function EnvironmentVariables() {
 
   const fetchVariables = async () => {
     try {
-      const response = await api.get<EnvVarMetadata[]>('/env-metadata');
+      const response = await api.get<EnvVarMetadata[]>('/env/metadata');
       setVariables(response.data);
     } catch (err) {
       console.error('Error fetching variables:', err);
-      setError('Failed to fetch environment variables');
+      setError(extractErrorMessage(err, 'Failed to fetch environment variables'));
     }
   };
 
@@ -73,7 +73,7 @@ export default function EnvironmentVariables() {
         });
       }).catch((err: any) => {
         console.error('Error fetching variable value:', err);
-        setError('Failed to fetch variable details');
+        setError(extractErrorMessage(err, 'Failed to fetch variable details'));
       });
     } else {
       setSelectedVar(null);

@@ -28,6 +28,7 @@ class ScheduledJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_run = Column(DateTime)
     is_active = Column(Integer, default=1)  # 1 for active, 0 for inactive
+    timeout = Column(Integer, default=30)  # Timeout in seconds
 
 class WebhookJob(Base):
     __tablename__ = "webhook_jobs"
@@ -62,6 +63,21 @@ class PersistentService(Base):
     process_id = Column(String(100))  # Docker exec process ID for running services
     auto_start = Column(Integer, default=1)  # 1 to auto-start on system startup
 
+class ExposedPort(Base):
+    __tablename__ = "exposed_ports"
+    
+    id = Column(Integer, primary_key=True)
+    container_id = Column(String(100), nullable=False)
+    internal_port = Column(Integer, nullable=False)  # Port inside container
+    external_port = Column(Integer, nullable=False)  # Exposed port on host
+    service_name = Column(String(100))  # Optional name for the service
+    service_type = Column(String(50))  # streamlit, fastapi, flask, dash, etc.
+    proxy_path = Column(String(200), unique=True, nullable=False)  # Unique path for proxy access
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_accessed = Column(DateTime)
+    is_active = Column(Integer, default=1)  # 1 for active, 0 for inactive
+    description = Column(Text)  # Optional description
+
 class ExecutionLog(Base):
     __tablename__ = "execution_logs"
     
@@ -79,12 +95,12 @@ class ExecutionLog(Base):
     request_data = Column(Text)  # For webhook jobs: the request payload
     response_data = Column(Text)  # For webhook jobs: the response payload
 
-# Create database and tables
+# Create database engine and session factory
 engine = create_engine('sqlite:///code_executor.db')
-Base.metadata.create_all(engine)
-
-# Create session factory
 SessionLocal = sessionmaker(bind=engine)
+
+# Note: Tables are created by the migration system in migrate_database.py
+# This ensures proper version tracking and schema migrations
 
 def get_db():
     db = SessionLocal()

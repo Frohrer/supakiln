@@ -7,7 +7,7 @@ import uvicorn
 import os
 
 # Import all routers
-from routers import containers, execution, jobs, webhooks, services, environment, logs, webhook_execution
+from routers import containers, execution, jobs, webhooks, services, environment, logs, webhook_execution, proxy
 
 # Import services and models for startup
 from services.service_manager import service_manager
@@ -52,16 +52,53 @@ app.include_router(services.router)
 app.include_router(environment.router)
 app.include_router(logs.router)
 app.include_router(webhook_execution.router)
+app.include_router(proxy.router)
 
 async def startup_event():
     """Initialize services on startup."""
+    import time
+    import sys
+    
+    # Run database migration with retry logic
+    max_retries = 5
+    retry_delay = 2
+    
+    migration_success = False
+    for attempt in range(max_retries):
+        try:
+            print(f"Running database migration (attempt {attempt + 1}/{max_retries})...")
+            from migrate_database import migrate_database
+            migrate_database()
+            print("✅ Database migration completed successfully")
+            migration_success = True
+            break
+        except Exception as e:
+            print(f"❌ Database migration failed (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"⏳ Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 1.5  # Exponential backoff
+            else:
+                print("💥 Failed to migrate database after all retries. Application cannot start.")
+                print("This is a critical error - the application requires a proper database schema.")
+                # Exit the application if migration fails
+                sys.exit(1)
+    
+    if not migration_success:
+        print("💥 Database migration failed. Application cannot start safely.")
+        sys.exit(1)
+    
+    # Initialize scheduler after migration is complete
     try:
-        # Run database migration
-        from migrate_database import migrate_database
-        migrate_database()
-        print("Database migration completed")
+        from scheduler import scheduler
+        scheduler.initialize()
+        print("✅ Scheduler initialized successfully")
+    except Exception as e:
+        print(f"❌ Failed to initialize scheduler: {e}")
         
-        # Auto-start services marked for auto-start
+    # Auto-start services marked for auto-start
+    try:
+        print("🚀 Starting auto-start services...")
         db = SessionLocal()
         try:
             auto_start_services = db.query(PersistentService).filter(
@@ -69,14 +106,23 @@ async def startup_event():
                 PersistentService.is_active == 1
             ).all()
             
-            for service in auto_start_services:
-                print(f"Auto-starting service: {service.name}")
-                service_manager.start_service(service.id, db)
+            if auto_start_services:
+                print(f"Found {len(auto_start_services)} services to auto-start")
+                for service in auto_start_services:
+                    try:
+                        print(f"Starting service: {service.name}")
+                        service_manager.start_service(service.id, db)
+                        print(f"✅ Service {service.name} started successfully")
+                    except Exception as e:
+                        print(f"❌ Failed to start service {service.name}: {e}")
+            else:
+                print("No services configured for auto-start")
         finally:
             db.close()
-            
     except Exception as e:
-        print(f"Startup error: {e}")
+        print(f"❌ Error during service auto-start: {e}")
+        
+    print("🎉 Application startup completed")
 
 # Add startup event
 @app.on_event("startup")

@@ -43,6 +43,21 @@ async def list_environment_variables():
     manager = get_env_manager()
     return manager.list_variables()
 
+@router.get("/metadata", response_model=List[EnvVarMetadata])
+async def list_environment_variable_metadata():
+    """List all environment variable metadata without values."""
+    manager = get_env_manager()
+    return manager.list_variables_with_metadata()
+
+@router.get("/metadata/{name}", response_model=EnvVarMetadata)
+async def get_environment_variable_metadata(name: str):
+    """Get an environment variable metadata without value."""
+    manager = get_env_manager()
+    metadata = manager.get_variable_metadata(name)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail="Environment variable not found")
+    return metadata
+
 @router.get("/{name}")
 async def get_environment_variable(name: str):
     """Get an environment variable value."""
@@ -58,19 +73,4 @@ async def delete_environment_variable(name: str):
     manager = get_env_manager()
     if not manager.delete_variable(name):
         raise HTTPException(status_code=404, detail="Environment variable not found")
-    return {"message": f"Environment variable {name} deleted successfully"}
-
-@router.get("/metadata", response_model=List[EnvVarMetadata])
-async def list_environment_variable_metadata():
-    """List all environment variable metadata without values."""
-    manager = get_env_manager()
-    return manager.list_variables_with_metadata()
-
-@router.get("/metadata/{name}", response_model=EnvVarMetadata)
-async def get_environment_variable_metadata(name: str):
-    """Get an environment variable metadata without value."""
-    manager = get_env_manager()
-    metadata = manager.get_variable_metadata(name)
-    if metadata is None:
-        raise HTTPException(status_code=404, detail="Environment variable not found")
-    return metadata 
+    return {"message": f"Environment variable {name} deleted successfully"} 

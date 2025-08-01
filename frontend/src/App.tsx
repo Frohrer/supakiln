@@ -6,7 +6,8 @@ import Editor from './pages/Editor';
 import Scheduler from './pages/Scheduler';
 import WebhookJobs from './pages/WebhookJobs';
 import Logs from './pages/Logs';
-import Containers from './pages/Containers';
+import SavedCode from './pages/Containers';
+import RunningContainers from './pages/RunningContainers';
 import EnvironmentVariables from './pages/EnvironmentVariables';
 
 const theme = createTheme({
@@ -29,7 +30,8 @@ function App() {
         <Layout>
           <Routes>
             <Route path="/" element={<Editor />} />
-            <Route path="/containers" element={<Containers />} />
+            <Route path="/saved-code" element={<SavedCode />} />
+            <Route path="/containers" element={<RunningContainers />} />
             <Route path="/scheduler" element={<Scheduler />} />
             <Route path="/webhooks" element={<WebhookJobs />} />
             <Route path="/logs" element={<Logs />} />
