@@ -63,14 +63,22 @@ async def list_containers():
     for package_hash, container_id in get_code_executor().containers.items():
         try:
             container = docker_client.containers.get(container_id)
-            # Extract packages from image tag
-            image_tag = container.image.tags[0]
-            packages = image_tag.split(":")[-1].split(",")
+            # Extract packages from image tag safely
+            packages = []
+            if container.image.tags and len(container.image.tags) > 0:
+                image_tag = container.image.tags[0]
+                if ":" in image_tag:
+                    tag_part = image_tag.split(":")[-1]
+                    if tag_part and "," in tag_part:
+                        packages = [pkg.strip() for pkg in tag_part.split(",") if pkg.strip()]
+                    elif tag_part:
+                        packages = [tag_part.strip()]
+            
             containers.append(ContainerResponse(
                 container_id=container_id,
                 name=container_names.get(container_id, "Unnamed"),
                 packages=packages,
-                created_at=container.attrs['Created']
+                created_at=container.attrs.get('Created', '')
             ))
         except Exception:
             continue
