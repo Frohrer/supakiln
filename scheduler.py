@@ -1,9 +1,13 @@
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
 import time
+import logging
 from models import SessionLocal, ScheduledJob, ExecutionLog
 from code_executor import CodeExecutor
+
+logger = logging.getLogger(__name__)
 
 class JobScheduler:
     def __init__(self):
@@ -12,12 +16,31 @@ class JobScheduler:
         self.scheduler.start()
         self._initialized = False
         # Don't load existing jobs immediately - wait for explicit initialization
-        
+
     def initialize(self):
         """Initialize the scheduler after database migration is complete."""
         if not self._initialized:
             self.load_existing_jobs()
+            self._schedule_cleanup_job()
             self._initialized = True
+
+    def _schedule_cleanup_job(self):
+        """Register the periodic cleanup job (runs every 6 hours)."""
+        from cleanup import run_periodic_cleanup
+
+        def _cleanup_wrapper():
+            try:
+                run_periodic_cleanup()
+            except Exception:
+                logger.exception("Periodic cleanup failed")
+
+        self.scheduler.add_job(
+            _cleanup_wrapper,
+            IntervalTrigger(hours=6),
+            id="__system_cleanup",
+            replace_existing=True,
+        )
+        logger.info("Scheduled periodic cleanup job (every 6 hours)")
 
     def load_existing_jobs(self):
         """Load all active jobs from the database and schedule them."""
