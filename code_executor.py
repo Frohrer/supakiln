@@ -7,16 +7,22 @@ import threading
 import base64
 import docker
 import random
+import logging
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from services.docker_client import docker_client
+
+logger = logging.getLogger(__name__)
+
+# Label used to identify containers managed by this app
+APP_LABEL = "managed-by=supakiln"
 
 class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
         self.image_name = image_name
         self.containers: Dict[str, str] = {}  # package_hash -> container_id
         self.web_service_containers: Dict[str, Dict] = {}  # container_id -> service_info
-        
+
         # Network mode configuration (defaults to 'none' for security)
         # Can be set to 'bridge' to allow network access when needed
         self.container_network_mode = os.environ.get('CONTAINER_NETWORK_MODE', 'none')
@@ -460,6 +466,7 @@ USER codeuser
                 "docker", "run",
                 "-d",
                 "-p", port_mapping,
+                "--label", APP_LABEL,
                 "--memory", "512m",
                 "--cpus", "0.5",
                 "--user", "1000:1000",
@@ -745,6 +752,7 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                 success, output, error = self._run_docker_command([
                     "docker", "run",
                     "-d",
+                    "--label", APP_LABEL,
                     "--memory", "512m",
                     "--cpus", "0.5",
                     "--network", self.container_network_mode,  # Configurable network mode
@@ -779,15 +787,23 @@ export PYTHONPATH=/tmp:$PYTHONPATH
             }
     
     def cleanup(self):
-        """Clean up all containers."""
+        """Clean up all tracked containers."""
         env = os.environ.copy()
-        for container_id in self.containers.values():
+        all_ids = list(self.containers.values()) + list(self.web_service_containers.keys())
+        for container_id in all_ids:
             try:
                 subprocess.run(["docker", "rm", "-f", container_id], capture_output=True, env=env)
             except Exception:
                 pass
         self.containers.clear()
         self.web_service_containers.clear()
+
+    def shutdown(self):
+        """Graceful shutdown: stop and remove all tracked containers."""
+        logger.info("Shutting down CodeExecutor, cleaning up %d containers...",
+                     len(self.containers) + len(self.web_service_containers))
+        self.cleanup()
+        logger.info("CodeExecutor shutdown complete")
 
 if __name__ == "__main__":
     # Example usage

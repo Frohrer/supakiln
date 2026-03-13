@@ -35,6 +35,7 @@ async def create_container(request: PackageInstallRequest):
                 image_tag,
                 detach=True,
                 tty=True,
+                labels={"managed-by": "supakiln"},
                 mem_limit="512m",
                 cpu_period=100000,
                 cpu_quota=50000,

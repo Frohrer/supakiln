@@ -29,12 +29,20 @@ services:
     environment:
       - DOCKER_TLS_CERTDIR=""  # Disable TLS for simplicity
     command: ["dockerd", "--host=tcp://0.0.0.0:2376", "--host=unix:///var/run/docker.sock"]
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: "2.0"
+        reservations:
+          memory: 512m
     healthcheck:
       test: ["CMD", "docker", "info"]
       interval: 5s
       timeout: 3s
       retries: 5
       start_period: 10s
+    restart: unless-stopped
 
   backend:
     build:

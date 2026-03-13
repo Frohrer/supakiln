@@ -58,11 +58,11 @@ async def startup_event():
     """Initialize services on startup."""
     import time
     import sys
-    
+
     # Run database migration with retry logic
     max_retries = 5
     retry_delay = 2
-    
+
     migration_success = False
     for attempt in range(max_retries):
         try:
@@ -83,11 +83,30 @@ async def startup_event():
                 print("This is a critical error - the application requires a proper database schema.")
                 # Exit the application if migration fails
                 sys.exit(1)
-    
+
     if not migration_success:
         print("💥 Database migration failed. Application cannot start safely.")
         sys.exit(1)
-    
+
+    # Clean up orphaned containers from previous runs/crashes
+    try:
+        from cleanup import reconcile_orphaned_containers, prune_dead_containers
+        from scheduler import scheduler
+
+        # First remove any dead/exited containers
+        dead = prune_dead_containers()
+        if dead:
+            print(f"🧹 Removed {dead} dead containers from previous run")
+
+        # Then reconcile orphans against the executor's tracking state
+        orphans = reconcile_orphaned_containers(scheduler.executor)
+        if orphans:
+            print(f"🧹 Removed {orphans} orphaned containers from previous run")
+        else:
+            print("✅ No orphaned containers found")
+    except Exception as e:
+        print(f"⚠️ Startup cleanup failed (non-fatal): {e}")
+
     # Initialize scheduler after migration is complete
     try:
         from scheduler import scheduler
@@ -95,7 +114,7 @@ async def startup_event():
         print("✅ Scheduler initialized successfully")
     except Exception as e:
         print(f"❌ Failed to initialize scheduler: {e}")
-        
+
     # Auto-start services marked for auto-start
     try:
         print("🚀 Starting auto-start services...")
@@ -105,7 +124,7 @@ async def startup_event():
                 PersistentService.auto_start == 1,
                 PersistentService.is_active == 1
             ).all()
-            
+
             if auto_start_services:
                 print(f"Found {len(auto_start_services)} services to auto-start")
                 for service in auto_start_services:
@@ -121,13 +140,28 @@ async def startup_event():
             db.close()
     except Exception as e:
         print(f"❌ Error during service auto-start: {e}")
-        
+
     print("🎉 Application startup completed")
+
+async def shutdown_event():
+    """Graceful shutdown: clean up all containers and stop scheduler."""
+    print("🛑 Application shutting down...")
+    try:
+        from scheduler import scheduler
+        scheduler.executor.shutdown()
+        scheduler.scheduler.shutdown(wait=False)
+        print("✅ Cleanup complete")
+    except Exception as e:
+        print(f"⚠️ Error during shutdown cleanup: {e}")
 
 # Add startup event
 @app.on_event("startup")
 async def on_startup():
     await startup_event()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await shutdown_event()
 
 if __name__ == "__main__":
     # Create static directory if it doesn't exist
