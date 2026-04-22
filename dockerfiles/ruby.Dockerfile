@@ -1,18 +1,16 @@
-FROM python:3.12-slim
+FROM ruby:3.3-slim
 
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Non-root execution user (matches --user 1000:1000 from CodeExecutor).
 RUN getent passwd 1000 >/dev/null 2>&1 || useradd -m -u 1000 codeuser
 
-# Worker lives at a fixed path inside the image.
 RUN mkdir -p /opt/supakiln && chown -R 1000:1000 /opt/supakiln
-
 COPY --chown=1000:1000 workers/worker.py /opt/supakiln/worker.py
 
-ENV SUPAKILN_RUN_CMD="python3 {file}"
-ENV SUPAKILN_FILE_EXT=".py"
+ENV SUPAKILN_RUN_CMD="ruby {file}"
+ENV SUPAKILN_FILE_EXT=".rb"
 
 USER 1000
 WORKDIR /tmp

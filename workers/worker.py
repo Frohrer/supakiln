@@ -1,13 +1,24 @@
-"""Supakiln Python worker.
+"""Supakiln multi-language worker.
 
-Long-running HTTP server inside each python-runtime container. Receives
-code-execution requests over TCP, runs them as subprocesses, and returns
-stdout / stderr / exit_code. Exists to bypass `docker exec` on the hot path
-(~75ms namespace-entry cost) — the backend reaches us directly over the
-dind bridge network instead.
+Long-running HTTP server inside each runtime container. Receives
+code-execution requests over TCP, writes the submitted code to a temp
+file, then spawns the language-specific interpreter/compiler as a
+subprocess. Exists to bypass `docker exec` on the hot path (~75ms
+namespace-entry cost) — the backend reaches us directly over the dind
+bridge network instead.
+
+The worker is language-agnostic: it is configured per-image via env vars.
+
+  SUPAKILN_RUN_CMD   shell command template; {file} is replaced with the
+                     path to the temp source file. Example:
+                       "python3 {file}"   "node {file}"   "bash {file}"
+                       "go run {file}"    "ruby {file}"
+  SUPAKILN_FILE_EXT  suffix for the temp file (".py", ".js", ".rb", ...).
+                     Some interpreters (e.g. go run) need a correct ext.
+  SUPAKILN_WORKER_PORT, SUPAKILN_WORKER_BIND   listen config.
 
 Wire contract:
-  GET  /health  -> 200 "ok"
+  GET  /health  -> 200 {"status": "ok"}
   POST /exec    -> body: {"code": str, "env": {str: str}, "timeout_ms": int}
                   resp: {"exit_code": int, "stdout": str, "stderr": str, "timed_out": bool}
 """
@@ -16,24 +27,31 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
-import sys
 import tempfile
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Tuple
 
 
 DEFAULT_PORT = 9999
 MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB guard against runaway payloads
 
+RUN_CMD_TEMPLATE = os.environ.get("SUPAKILN_RUN_CMD", "python3 {file}")
+FILE_EXT = os.environ.get("SUPAKILN_FILE_EXT", ".py")
+
+
+def _build_command(file_path: str) -> list:
+    """Render RUN_CMD_TEMPLATE by substituting {file}, respecting shell splitting."""
+    parts = shlex.split(RUN_CMD_TEMPLATE)
+    return [p.replace("{file}", file_path) for p in parts]
+
 
 def _run_code(code: str, env: dict, timeout_ms: int) -> dict:
-    """Write code to a temp .py and exec it with a clean subprocess."""
+    """Write code to a temp file and exec it via RUN_CMD_TEMPLATE."""
     timeout_s = max(0.001, timeout_ms / 1000.0)
     # Use /tmp inside the container (tmpfs-friendly, always writable).
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, dir="/tmp", encoding="utf-8"
+        mode="w", suffix=FILE_EXT, delete=False, dir="/tmp", encoding="utf-8"
     ) as f:
         f.write(code)
         fname = f.name
@@ -44,11 +62,12 @@ def _run_code(code: str, env: dict, timeout_ms: int) -> dict:
 
     try:
         result = subprocess.run(
-            [sys.executable, fname],
+            _build_command(fname),
             capture_output=True,
             text=True,
             timeout=timeout_s,
             env=proc_env,
+            cwd="/tmp",
         )
         return {
             "exit_code": result.returncode,

@@ -16,6 +16,10 @@ from typing import Dict, List
 
 from .base import Runtime
 from .python import PYTHON
+from .node import NODE
+from .ruby import RUBY
+from .bash import BASH
+from .go import GO
 
 
 _REGISTRY: Dict[str, Runtime] = {}
@@ -36,7 +40,8 @@ def names() -> List[str]:
 
 
 # Register built-ins at import time.
-register(PYTHON)
+for _rt in (PYTHON, NODE, RUBY, BASH, GO):
+    register(_rt)
 
 
-__all__ = ["Runtime", "register", "get", "names", "PYTHON"]
+__all__ = ["Runtime", "register", "get", "names", "PYTHON", "NODE", "RUBY", "BASH", "GO"]
