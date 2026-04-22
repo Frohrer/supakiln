@@ -18,7 +18,7 @@ class EnvironmentVariable(Base):
 
 class ScheduledJob(Base):
     __tablename__ = "scheduled_jobs"
-    
+
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     code = Column(Text, nullable=False)
@@ -29,10 +29,11 @@ class ScheduledJob(Base):
     last_run = Column(DateTime)
     is_active = Column(Integer, default=1)  # 1 for active, 0 for inactive
     timeout = Column(Integer, default=30)  # Timeout in seconds
+    language = Column(String(20), default="python")
 
 class WebhookJob(Base):
     __tablename__ = "webhook_jobs"
-    
+
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     endpoint = Column(String(200), unique=True, nullable=False)  # URL path like /webhook/my-job
@@ -44,10 +45,11 @@ class WebhookJob(Base):
     is_active = Column(Integer, default=1)  # 1 for active, 0 for inactive
     timeout = Column(Integer, default=30)  # Timeout in seconds
     description = Column(Text)  # Optional description
+    language = Column(String(20), default="python")
 
 class PersistentService(Base):
     __tablename__ = "persistent_services"
-    
+
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     code = Column(Text, nullable=False)
@@ -62,6 +64,7 @@ class PersistentService(Base):
     description = Column(Text)  # Optional description
     process_id = Column(String(100))  # Docker exec process ID for running services
     auto_start = Column(Integer, default=1)  # 1 to auto-start on system startup
+    language = Column(String(20), default="python")
 
 class ExposedPort(Base):
     __tablename__ = "exposed_ports"

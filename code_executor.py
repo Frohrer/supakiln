@@ -8,27 +8,64 @@ import base64
 import docker
 import random
 import logging
+import requests
 from time import perf_counter
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from urllib.parse import urlparse
 from services.docker_client import docker_client
+from languages import get as get_runtime
+from languages.base import Runtime, build_package_install_snippet
 
 logger = logging.getLogger(__name__)
 
 # Label used to identify containers managed by this app
 APP_LABEL = "managed-by=supakiln"
 
+
+def _worker_host_from_env() -> str:
+    """Resolve the hostname the backend uses to reach user-container published ports.
+
+    In the docker-compose/dind setup, published ports bind on the dind
+    daemon's host (the `docker-daemon` service). If DOCKER_HOST is a TCP
+    URL, its hostname is that. Otherwise (host docker socket), user
+    containers publish to localhost.
+    """
+    override = os.environ.get("SUPAKILN_WORKER_HOST")
+    if override:
+        return override
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host.startswith("tcp://"):
+        parsed = urlparse(docker_host)
+        return parsed.hostname or "localhost"
+    return "localhost"
+
+
 class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
+        # Legacy image name retained for the web-service execution path,
+        # which still uses the pre-existing `python-executor:*` images.
         self.image_name = image_name
-        self.containers: Dict[str, str] = {}  # package_hash -> container_id
+        # Legacy cache: package_hash -> container_id (used by web services
+        # and debug endpoints). Kept for backwards compatibility.
+        self.containers: Dict[str, str] = {}
         self.web_service_containers: Dict[str, Dict] = {}  # container_id -> service_info
+
+        # Worker-path cache: "lang:package_hash" -> container_id
+        self.worker_containers: Dict[str, str] = {}
+        # Worker endpoints: container_id -> (host, port) to reach its HTTP API
+        self.worker_endpoints: Dict[str, Tuple[str, int]] = {}
+        # HTTP session with connection pooling so each /exec POST reuses a
+        # TCP connection to the worker when possible.
+        self._http = requests.Session()
+        self._worker_host = _worker_host_from_env()
 
         # Network mode configuration (defaults to 'none' for security)
         # Can be set to 'bridge' to allow network access when needed
         self.container_network_mode = os.environ.get('CONTAINER_NETWORK_MODE', 'none')
         print(f"🔒 Container network mode: {self.container_network_mode}")
         self._base_image_ready = False
+        self._runtime_images_ready: Dict[str, bool] = {}
         
     def _run_docker_command(self, command: List[str], timeout: int = 30) -> Tuple[bool, str, Optional[str]]:
         """Run a Docker command and return (success, output, error)."""
@@ -243,6 +280,193 @@ USER codeuser
         
         return f"Failed to build image with packages: {', '.join(packages)}\n\nFull error: {docker_error}"
 
+    # ------------------------------------------------------------------
+    # Runtime + worker path (ad-hoc execution, multi-language)
+    #
+    # Each supported language has its own base image (e.g.
+    # `supakiln-python:base`) with a long-running HTTP worker baked in as
+    # CMD. Backend talks to the worker directly over the dind bridge
+    # (via published ports), bypassing `docker exec` on the hot path.
+    # ------------------------------------------------------------------
+
+    def _ensure_runtime_base_image(self, runtime: Runtime) -> None:
+        """Build the runtime's base image if it isn't already present."""
+        if self._runtime_images_ready.get(runtime.name):
+            return
+        tag = runtime.base_image_tag
+        success, _, _ = self._run_docker_command(["docker", "image", "inspect", tag])
+        if not success:
+            print(f"Building {tag} from {runtime.dockerfile_path}...")
+            success, _, error = self._run_docker_command(
+                ["docker", "build", "-t", tag, "-f", runtime.dockerfile_path, "."],
+                timeout=600,
+            )
+            if not success:
+                raise Exception(f"Failed to build {tag}: {error}")
+        self._runtime_images_ready[runtime.name] = True
+
+    def _build_runtime_image(self, runtime: Runtime, packages: List[str]) -> str:
+        """Return an image tag for `runtime + packages`, building if needed."""
+        self._ensure_runtime_base_image(runtime)
+        if not packages:
+            return runtime.base_image_tag
+
+        package_hash = self._get_package_hash(packages)
+        base_name = runtime.base_image_tag.split(":", 1)[0]
+        image_tag = f"{base_name}:{package_hash}"
+
+        success, _, _ = self._run_docker_command(["docker", "image", "inspect", image_tag])
+        if success:
+            return image_tag
+
+        install_snippet = build_package_install_snippet(runtime, packages)
+        if not install_snippet:
+            # Runtime doesn't support package installation; callers should
+            # not be passing packages, but fall back to base image rather
+            # than erroring.
+            return runtime.base_image_tag
+
+        dockerfile_content = (
+            f"FROM {runtime.base_image_tag}\n"
+            f"{install_snippet}"
+        )
+        tmp_path = f"Dockerfile.{runtime.name}.{package_hash}.tmp"
+        with open(tmp_path, "w") as f:
+            f.write(dockerfile_content)
+        try:
+            success, _, error = self._run_docker_command(
+                ["docker", "build", "-t", image_tag, "-f", tmp_path, "."],
+                timeout=600,
+            )
+            if not success:
+                raise Exception(self._parse_docker_build_error(error, packages))
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        return image_tag
+
+    def _read_worker_port(self, container_id: str, worker_port: int) -> int:
+        """Read the published host-port for the worker container."""
+        container = docker_client.containers.get(container_id)
+        container.reload()
+        port_info = (container.attrs.get("NetworkSettings", {})
+                     .get("Ports", {})
+                     .get(f"{worker_port}/tcp"))
+        if not port_info:
+            raise Exception(f"worker port {worker_port} not published on {container_id[:12]}")
+        return int(port_info[0]["HostPort"])
+
+    def _wait_for_worker_health(self, host: str, port: int, timeout_s: float = 15.0) -> None:
+        """Poll GET /health until 200 or timeout."""
+        deadline = perf_counter() + timeout_s
+        url = f"http://{host}:{port}/health"
+        last_err: Optional[str] = None
+        while perf_counter() < deadline:
+            try:
+                r = self._http.get(url, timeout=1.0)
+                if r.status_code == 200:
+                    return
+                last_err = f"status={r.status_code}"
+            except requests.RequestException as e:
+                last_err = str(e)
+            time.sleep(0.05)
+        raise Exception(f"worker at {host}:{port} not healthy after {timeout_s}s ({last_err})")
+
+    def _get_or_create_worker_container(
+        self,
+        runtime: Runtime,
+        packages: List[str],
+        timings: Dict[str, float],
+    ) -> Tuple[str, str, int]:
+        """Return (container_id, worker_host, worker_port), creating if needed."""
+        package_hash = self._get_package_hash(packages)
+        cache_key = f"{runtime.name}:{package_hash}"
+
+        if cache_key in self.worker_containers:
+            container_id = self.worker_containers[cache_key]
+            host, port = self.worker_endpoints[container_id]
+            timings['container_cache_hit'] = 1.0
+            return container_id, host, port
+
+        timings['container_cache_hit'] = 0.0
+        t_build = perf_counter()
+        image_tag = self._build_runtime_image(runtime, packages)
+        timings['build_image_ms'] = (perf_counter() - t_build) * 1000
+
+        t_run = perf_counter()
+        success, output, error = self._run_docker_command([
+            "docker", "run",
+            "-d",
+            "--label", APP_LABEL,
+            "--memory", "512m",
+            "--cpus", "0.5",
+            "--network", "bridge",  # worker needs network; dind bridge only
+            "--user", "1000:1000",
+            "--cap-drop", "ALL",
+            "--pids-limit", "100",
+            "-p", str(runtime.worker_port),  # publish to random host port on dind
+            image_tag,
+        ])
+        timings['docker_run_ms'] = (perf_counter() - t_run) * 1000
+        if not success:
+            raise Exception(f"Failed to create worker container: {error}")
+        container_id = output.strip()
+
+        t_port = perf_counter()
+        host_port = self._read_worker_port(container_id, runtime.worker_port)
+        timings['read_port_ms'] = (perf_counter() - t_port) * 1000
+
+        host = self._worker_host
+        t_health = perf_counter()
+        self._wait_for_worker_health(host, host_port)
+        timings['worker_health_ms'] = (perf_counter() - t_health) * 1000
+
+        self.worker_containers[cache_key] = container_id
+        self.worker_endpoints[container_id] = (host, host_port)
+        # Also register in the legacy `containers` dict so existing code
+        # (debug endpoints, container_id lookups) still works.
+        self.containers[cache_key] = container_id
+        return container_id, host, host_port
+
+    def _exec_via_worker(
+        self,
+        host: str,
+        port: int,
+        code: str,
+        env_vars: Dict[str, str],
+        timeout_ms: int,
+    ) -> Tuple[bool, Optional[str], Optional[str], bool]:
+        """POST code to the worker; return (success, stdout, stderr, timed_out)."""
+        url = f"http://{host}:{port}/exec"
+        # Worker enforces timeout on its side; we give the HTTP client a
+        # small slack buffer so the server can surface a timed_out=True
+        # response rather than us hanging up.
+        http_timeout = max(1.0, timeout_ms / 1000.0 + 5.0)
+        try:
+            r = self._http.post(
+                url,
+                json={"code": code, "env": env_vars or {}, "timeout_ms": timeout_ms},
+                timeout=http_timeout,
+            )
+        except requests.Timeout:
+            return False, None, "worker HTTP request timed out", True
+        except requests.RequestException as e:
+            return False, None, f"worker request failed: {e}", False
+
+        if r.status_code != 200:
+            return False, None, f"worker returned status {r.status_code}: {r.text}", False
+        try:
+            body = r.json()
+        except ValueError:
+            return False, None, f"worker returned non-JSON: {r.text[:200]}", False
+        success = body.get("exit_code") == 0 and not body.get("timed_out", False)
+        return (
+            success,
+            body.get("stdout"),
+            body.get("stderr"),
+            bool(body.get("timed_out", False)),
+        )
+
     def _execute_with_timeout(self, container_id: str, command: str, timeout: int) -> Tuple[bool, str, Optional[str]]:
         """Execute a command in a container with timeout."""
         try:
@@ -427,15 +651,24 @@ USER codeuser
         
         return success and not timed_out, combined_output, combined_error, timed_out
     
-    def execute_code(self, code: str, packages: List[str], timeout: int = 30, env_vars: Dict[str, str] = None) -> Dict:
+    def execute_code(
+        self,
+        code: str,
+        packages: List[str],
+        timeout: int = 30,
+        env_vars: Dict[str, str] = None,
+        language: str = "python",
+    ) -> Dict:
         """
-        Execute Python code in a container with the specified packages.
+        Execute code in a container with the specified packages.
 
         Args:
-            code: Python code to execute
-            packages: List of required Python packages
+            code: Source code to execute
+            packages: List of required packages (interpretation depends on language)
             timeout: Maximum execution time in seconds
             env_vars: Dictionary of environment variables to pass to the container
+            language: Runtime to use (default "python"). Must be registered
+                      in the `languages` module.
 
         Returns:
             Dict containing execution results
@@ -450,10 +683,14 @@ USER codeuser
         package_hash = self._get_package_hash(packages)
         timings['package_hash_ms'] = (perf_counter() - t_hash) * 1000
 
-        # Detect if this is a web service
-        t_detect = perf_counter()
-        web_service = self._detect_web_service(code, packages)
-        timings['detect_web_service_ms'] = (perf_counter() - t_detect) * 1000
+        # Web-service detection only applies to Python (Streamlit/FastAPI/
+        # Flask/Dash/Gradio). Non-Python languages always take the ad-hoc
+        # worker path.
+        web_service = None
+        if language == "python":
+            t_detect = perf_counter()
+            web_service = self._detect_web_service(code, packages)
+            timings['detect_web_service_ms'] = (perf_counter() - t_detect) * 1000
         
         # For web services, always create a new container
         # For regular code, use package hash to potentially reuse containers
@@ -758,53 +995,45 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                 }
             }
         else:
-            # Regular code execution - use package hash to potentially reuse containers
-            cache_hit = package_hash in self.containers
-            timings['container_cache_hit'] = 1.0 if cache_hit else 0.0
-            if not cache_hit:
-                t_build = perf_counter()
-                image_tag = self._build_image(packages)
-                timings['build_image_ms'] = (perf_counter() - t_build) * 1000
+            # Ad-hoc code execution via the per-language worker. Containers
+            # are cached per (language, package_hash) so subsequent runs
+            # against the same environment reuse the live worker.
+            try:
+                runtime = get_runtime(language)
+            except KeyError as e:
+                timings['total_ms'] = (perf_counter() - t_start) * 1000
+                return {
+                    "success": False,
+                    "output": None,
+                    "error": str(e),
+                    "timings_ms": timings,
+                }
 
-                # Regular container for non-web services (no environment variables at creation)
-                t_run = perf_counter()
-                success, output, error = self._run_docker_command([
-                    "docker", "run",
-                    "-d",
-                    "--label", APP_LABEL,
-                    "--memory", "512m",
-                    "--cpus", "0.5",
-                    "--network", self.container_network_mode,  # Configurable network mode
-                    "--user", "1000:1000",
-                    "--cap-drop", "ALL",  # Remove all capabilities
-                    "--pids-limit", "100"  # Limit number of processes (keep reasonable limit)
-                ] + [
-                    image_tag,
-                    "tail", "-f", "/dev/null"
-                ])
-                timings['docker_run_ms'] = (perf_counter() - t_run) * 1000
-                if not success:
-                    return {
-                        "success": False,
-                        "output": None,
-                        "error": f"Failed to create container: {error}",
-                        "timings_ms": {**timings, 'total_ms': (perf_counter() - t_start) * 1000},
-                    }
-                container_id = output.strip()
-                self.containers[package_hash] = container_id
+            try:
+                container_id, host, port = self._get_or_create_worker_container(
+                    runtime, packages, timings,
+                )
+            except Exception as e:
+                timings['total_ms'] = (perf_counter() - t_start) * 1000
+                return {
+                    "success": False,
+                    "output": None,
+                    "error": f"Failed to prepare worker container: {e}",
+                    "timings_ms": timings,
+                }
 
-            container_id = self.containers[package_hash]
-
-            # Regular code execution with environment variables injected at execution time
-            t_encode = perf_counter()
-            encoded_code = base64.b64encode(code.encode()).decode()
-            timings['base64_encode_ms'] = (perf_counter() - t_encode) * 1000
-
-            t_full_exec = perf_counter()
-            success, output, error, timed_out = self._execute_with_streaming_timeout_and_env(container_id, encoded_code, timeout, env_vars, timings=timings)
-            timings['full_exec_ms'] = (perf_counter() - t_full_exec) * 1000
+            t_exec = perf_counter()
+            success, stdout, stderr, timed_out = self._exec_via_worker(
+                host, port, code, env_vars, timeout_ms=int(timeout * 1000),
+            )
+            timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
             timings['total_ms'] = (perf_counter() - t_start) * 1000
 
+            output = stdout if stdout else None
+            # Preserve existing contract: stderr is returned as `error` iff
+            # the process actually failed (non-zero exit or timeout); a
+            # successful run with stderr chatter still reports success.
+            error = stderr if (not success or timed_out) and stderr else None
             return {
                 "success": success,
                 "output": output,
@@ -817,14 +1046,20 @@ export PYTHONPATH=/tmp:$PYTHONPATH
     def cleanup(self):
         """Clean up all tracked containers."""
         env = os.environ.copy()
-        all_ids = list(self.containers.values()) + list(self.web_service_containers.keys())
-        for container_id in all_ids:
+        all_ids = (
+            list(self.containers.values())
+            + list(self.web_service_containers.keys())
+            + list(self.worker_containers.values())
+        )
+        for container_id in set(all_ids):
             try:
                 subprocess.run(["docker", "rm", "-f", container_id], capture_output=True, env=env)
             except Exception:
                 pass
         self.containers.clear()
         self.web_service_containers.clear()
+        self.worker_containers.clear()
+        self.worker_endpoints.clear()
 
     def shutdown(self):
         """Graceful shutdown: stop and remove all tracked containers."""

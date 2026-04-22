@@ -245,7 +245,8 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                 code=request.code,
                 packages=request.packages,
                 timeout=request.timeout or 30,
-                env_vars=env_vars
+                env_vars=env_vars,
+                language=request.language or "python",
             )
             
             # Log the execution
@@ -306,6 +307,13 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             print(f"Original error: {error_msg}")
         
         raise HTTPException(status_code=500, detail=error_msg)
+
+@router.get("/languages")
+async def list_languages():
+    """Return the set of runtimes the server can execute code in."""
+    import languages as lang_registry
+    return {"languages": lang_registry.names()}
+
 
 @router.get("/debug/containers")
 async def debug_containers():

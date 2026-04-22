@@ -8,6 +8,7 @@ class CodeExecutionRequest(BaseModel):
     packages: Optional[List[str]] = None
     timeout: Optional[int] = 30
     container_id: Optional[str] = None
+    language: Optional[str] = "python"
 
 class PackageInstallRequest(BaseModel):
     name: str
@@ -27,6 +28,7 @@ class ScheduledJobRequest(BaseModel):
     container_id: Optional[str] = None
     packages: Optional[List[str]] = None
     timeout: Optional[int] = 30
+    language: Optional[str] = "python"
 
 class ScheduledJobResponse(BaseModel):
     id: int
@@ -77,6 +79,7 @@ class WebhookJobRequest(BaseModel):
     packages: Optional[List[str]] = None
     timeout: Optional[int] = 30
     description: Optional[str] = None
+    language: Optional[str] = "python"
 
 class WebhookJobResponse(BaseModel):
     id: int
@@ -99,6 +102,7 @@ class PersistentServiceRequest(BaseModel):
     restart_policy: Optional[str] = "always"  # always, never, on-failure
     description: Optional[str] = None
     auto_start: Optional[bool] = True
+    language: Optional[str] = "python"
 
 class PersistentServiceResponse(BaseModel):
     id: int

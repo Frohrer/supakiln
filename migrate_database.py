@@ -22,7 +22,7 @@ def migrate_database():
             # No tables exist (or no schema_info), create complete database schema
             print("🆕 Creating complete database schema...")
             create_complete_schema(cursor)
-            current_version = 7
+            current_version = 8
             print(f"✅ Database created with version {current_version}")
         else:
             # Tables exist, check version and apply migrations
@@ -38,10 +38,10 @@ def migrate_database():
             print(f"Current database version: {current_version}")
             
             # Apply migrations if needed
-            if current_version < 7:
-                print(f"⬆️  Upgrading database from version {current_version} to 7...")
+            if current_version < 8:
+                print(f"⬆️  Upgrading database from version {current_version} to 8...")
                 apply_migrations(cursor, current_version)
-                current_version = 7
+                current_version = 8
                 print(f"✅ Database upgraded to version {current_version}")
         
         # Verify the final schema
@@ -93,7 +93,8 @@ def create_complete_schema(cursor):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_run TIMESTAMP,
             is_active INTEGER DEFAULT 1,
-            timeout INTEGER DEFAULT 30
+            timeout INTEGER DEFAULT 30,
+            language VARCHAR(20) DEFAULT 'python'
         )
     """)
     
@@ -110,10 +111,11 @@ def create_complete_schema(cursor):
             last_triggered TIMESTAMP,
             is_active INTEGER DEFAULT 1,
             timeout INTEGER DEFAULT 30,
-            description TEXT
+            description TEXT,
+            language VARCHAR(20) DEFAULT 'python'
         )
     """)
-    
+
     # Create persistent_services table
     cursor.execute("""
         CREATE TABLE persistent_services (
@@ -130,7 +132,8 @@ def create_complete_schema(cursor):
             restart_policy VARCHAR(20) DEFAULT 'always',
             description TEXT,
             process_id VARCHAR(100),
-            auto_start INTEGER DEFAULT 1
+            auto_start INTEGER DEFAULT 1,
+            language VARCHAR(20) DEFAULT 'python'
         )
     """)
     
@@ -171,7 +174,7 @@ def create_complete_schema(cursor):
     """)
     
     # Set version to latest
-    cursor.execute("INSERT INTO schema_info (key, value) VALUES ('version', '7')")
+    cursor.execute("INSERT INTO schema_info (key, value) VALUES ('version', '8')")
 
 def apply_migrations(cursor, current_version):
     """Apply migrations from current_version to latest."""
@@ -292,8 +295,22 @@ def apply_migrations(cursor, current_version):
         )
     """)
     
+    # Migration v7 -> v8: add `language` column to code-bearing tables
+    if current_version < 8:
+        for table in ("scheduled_jobs", "webhook_jobs", "persistent_services"):
+            print(f"Adding language column to {table}...")
+            try:
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN language VARCHAR(20) DEFAULT 'python'"
+                )
+                print(f"✅ Added language column to {table}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
+                print(f"✅ language column already exists in {table}")
+
     # Update version
-    cursor.execute("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '7')")
+    cursor.execute("INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '8')")
 
 def verify_schema(cursor):
     """Verify that all required tables and columns exist."""
