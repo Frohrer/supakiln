@@ -271,11 +271,15 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
                 "container_id": container_id,
                 "container_name": container_names.get(container_id, "Unnamed")
             }
-            
+
             # Include web service info if available
             if "web_service" in result:
                 response["web_service"] = result["web_service"]
-            
+
+            # Pass through timing breakdown for benchmarks/profiling
+            if "timings_ms" in result:
+                response["timings_ms"] = result["timings_ms"]
+
             return response
     except HTTPException:
         # Re-raise HTTPExceptions (like 404, 400, etc.) without catching them

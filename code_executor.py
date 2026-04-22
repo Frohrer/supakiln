@@ -8,6 +8,7 @@ import base64
 import docker
 import random
 import logging
+from time import perf_counter
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from services.docker_client import docker_client
@@ -345,27 +346,33 @@ USER codeuser
         
         return success and not timed_out, combined_output, combined_error, timed_out
     
-    def _execute_with_streaming_timeout_and_env(self, container_id: str, encoded_code: str, timeout: int, env_vars: Dict[str, str]) -> Tuple[bool, str, Optional[str], bool]:
+    def _execute_with_streaming_timeout_and_env(self, container_id: str, encoded_code: str, timeout: int, env_vars: Dict[str, str], timings: Optional[Dict[str, float]] = None) -> Tuple[bool, str, Optional[str], bool]:
         """Execute code in a container with environment variables injected at execution time."""
         import threading
         import docker
-        
+
         output_buffer = []
         error_buffer = []
         success = False
         timed_out = False
-        
+        # Shared timings dict so we can measure phases inside the worker thread
+        t = timings if timings is not None else {}
+
         def collect_output():
             nonlocal success, timed_out
             try:
+                t_get = perf_counter()
                 container = docker_client.containers.get(container_id)
+                t['containers_get_ms'] = (perf_counter() - t_get) * 1000
                 # Execute with environment variables injected at execution time
+                t_exec = perf_counter()
                 result = container.exec_run(
                     f"python3 -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
                     environment=env_vars,  # Inject environment variables here
                     stream=False,  # Don't stream to get proper exit code
                     demux=True     # Separate stdout and stderr
                 )
+                t['exec_run_ms'] = (perf_counter() - t_exec) * 1000
                 
                 # Process the output
                 if result.output:
@@ -423,23 +430,30 @@ USER codeuser
     def execute_code(self, code: str, packages: List[str], timeout: int = 30, env_vars: Dict[str, str] = None) -> Dict:
         """
         Execute Python code in a container with the specified packages.
-        
+
         Args:
             code: Python code to execute
             packages: List of required Python packages
             timeout: Maximum execution time in seconds
             env_vars: Dictionary of environment variables to pass to the container
-            
+
         Returns:
             Dict containing execution results
         """
+        t_start = perf_counter()
+        timings: Dict[str, float] = {}
+
         if env_vars is None:
             env_vars = {}
-            
+
+        t_hash = perf_counter()
         package_hash = self._get_package_hash(packages)
-        
+        timings['package_hash_ms'] = (perf_counter() - t_hash) * 1000
+
         # Detect if this is a web service
+        t_detect = perf_counter()
         web_service = self._detect_web_service(code, packages)
+        timings['detect_web_service_ms'] = (perf_counter() - t_detect) * 1000
         
         # For web services, always create a new container
         # For regular code, use package hash to potentially reuse containers
@@ -745,10 +759,15 @@ export PYTHONPATH=/tmp:$PYTHONPATH
             }
         else:
             # Regular code execution - use package hash to potentially reuse containers
-            if package_hash not in self.containers:
+            cache_hit = package_hash in self.containers
+            timings['container_cache_hit'] = 1.0 if cache_hit else 0.0
+            if not cache_hit:
+                t_build = perf_counter()
                 image_tag = self._build_image(packages)
-                
+                timings['build_image_ms'] = (perf_counter() - t_build) * 1000
+
                 # Regular container for non-web services (no environment variables at creation)
+                t_run = perf_counter()
                 success, output, error = self._run_docker_command([
                     "docker", "run",
                     "-d",
@@ -763,27 +782,36 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                     image_tag,
                     "tail", "-f", "/dev/null"
                 ])
+                timings['docker_run_ms'] = (perf_counter() - t_run) * 1000
                 if not success:
                     return {
                         "success": False,
                         "output": None,
-                        "error": f"Failed to create container: {error}"
+                        "error": f"Failed to create container: {error}",
+                        "timings_ms": {**timings, 'total_ms': (perf_counter() - t_start) * 1000},
                     }
                 container_id = output.strip()
                 self.containers[package_hash] = container_id
-            
+
             container_id = self.containers[package_hash]
-            
+
             # Regular code execution with environment variables injected at execution time
+            t_encode = perf_counter()
             encoded_code = base64.b64encode(code.encode()).decode()
-            success, output, error, timed_out = self._execute_with_streaming_timeout_and_env(container_id, encoded_code, timeout, env_vars)
-            
+            timings['base64_encode_ms'] = (perf_counter() - t_encode) * 1000
+
+            t_full_exec = perf_counter()
+            success, output, error, timed_out = self._execute_with_streaming_timeout_and_env(container_id, encoded_code, timeout, env_vars, timings=timings)
+            timings['full_exec_ms'] = (perf_counter() - t_full_exec) * 1000
+            timings['total_ms'] = (perf_counter() - t_start) * 1000
+
             return {
                 "success": success,
                 "output": output,
                 "error": error,
                 "container_id": container_id,
-                "timed_out": timed_out
+                "timed_out": timed_out,
+                "timings_ms": timings,
             }
     
     def cleanup(self):
