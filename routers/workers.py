@@ -39,16 +39,31 @@ def _format_worker(w: Dict) -> Dict:
     }
 
 
-@router.get("")
+@router.get("", summary="List live ad-hoc workers")
 async def list_workers() -> Dict[str, List[Dict]]:
-    """Snapshot of live ad-hoc workers."""
+    """Return a snapshot of every worker container currently cached.
+
+    Each entry: `container_id`, `container_short_id` (12-char),
+    `language`, `package_hash`, `cache_key`, `host`, `port`,
+    `created_at` (ISO), `last_used` (ISO). The idle reaper uses
+    `last_used` vs. `SUPAKILN_WORKER_IDLE_TTL_SECONDS` to decide what
+    to kill; this list shows you the live state between reaps.
+    """
     workers = get_code_executor().list_workers()
     return {"workers": [_format_worker(w) for w in workers]}
 
 
-@router.delete("/{container_id}")
+@router.delete("/{container_id}", summary="Stop one worker")
 async def stop_worker(container_id: str) -> Dict[str, object]:
-    """Force-kill a specific worker. Accepts short (12-char) or full ID."""
+    """Force-kill a tracked worker and evict its cache entry.
+
+    Accepts either a 12-character short ID (as returned from `GET /workers`
+    or `POST /execute`) or a full 64-character container ID. If the ID
+    prefix matches multiple live workers, returns 400. If the container
+    isn't tracked, returns 404 — though it still best-effort removes
+    the container in case it's a stale one the executor lost track of
+    after a restart.
+    """
     executor = get_code_executor()
     # Resolve a short ID to the full one if needed.
     if len(container_id) < 64:
@@ -69,8 +84,12 @@ async def stop_worker(container_id: str) -> Dict[str, object]:
     return {"stopped": container_id}
 
 
-@router.post("/reset")
+@router.post("/reset", summary="Stop every ad-hoc worker")
 async def reset_workers() -> Dict[str, int]:
-    """Kill every ad-hoc worker (does not touch web-service containers)."""
+    """Kill every cached ad-hoc worker container.
+
+    Does not touch persistent-service containers (those have their own
+    lifecycle under `/services`). Response: `{"killed": N}`.
+    """
     killed = get_code_executor().reset_workers()
     return {"killed": killed}

@@ -34,11 +34,15 @@ def get_env_manager():
     finally:
         db.close()
 
-@router.post("/execute-web-service")
+@router.post("/execute-web-service", summary="Start a Python web service")
 async def execute_web_service(request: CodeExecutionRequest, db: Session = Depends(get_db)):
-    """
-    Execute Python code specifically optimized for web services (Streamlit, FastAPI, Flask, Dash).
-    This endpoint always uses the CodeExecutor.execute_code method for proper web service detection.
+    """Execute Python code and detect if it's a web framework (Streamlit,
+    FastAPI, Flask, Dash, or Gradio) — if so, spin up a long-running
+    container, publish its port, and return a `proxy_url` under `/proxy/...`.
+
+    Effectively the same as `POST /execute` with `language=python`, but
+    with a 60s timeout and no language selection. Use `/execute` for
+    snippets; use this endpoint (or `POST /services`) for web apps.
     """
     start_time = time.time()
     try:
@@ -97,12 +101,36 @@ async def execute_web_service(request: CodeExecutionRequest, db: Session = Depen
         
         raise HTTPException(status_code=500, detail=error_msg)
 
-@router.post("/execute")
+@router.post("/execute", summary="Run code in the selected runtime")
 async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_db)):
-    """
-    Execute Python code in a container.
-    If container_id is provided, use that container.
-    Otherwise, create a new container with the specified packages.
+    """Execute a snippet in an isolated Docker container.
+
+    Picks a runtime from `request.language` (default `python`; call
+    `GET /languages` for the full list). The executor caches one worker
+    container per `(language, package_hash)` so repeat calls against the
+    same environment reuse a live HTTP worker — warm-path latency is
+    typically 10–30ms for interpreted languages.
+
+    **Body**
+    - `code` *(required)* — the source to execute
+    - `language` — `python` | `node` | `ruby` | `bash` | `go` (default `python`)
+    - `packages` — list of package specifiers for the runtime's package
+      manager (pip / npm / gem). Ignored for `bash` and `go`.
+    - `timeout` — seconds (default 30)
+    - `container_id` — if set, execute against an already-named container
+      via the legacy docker-exec path (bypasses the worker cache)
+
+    **Response**
+    - `success`: `bool`
+    - `output`: stdout as a string (or `null`)
+    - `error`: stderr or failure reason (or `null`)
+    - `container_id`: the worker container that ran this call
+    - `timed_out`: `bool`
+    - `timings_ms`: per-phase timing breakdown (cold vs. warm)
+    - `web_service`: present only when Python web-framework detection
+      fires; contains `type`, `external_port`, `proxy_url`
+
+    Returns `400` if the language isn't registered; `500` on other failures.
     """
     start_time = time.time()
     try:
@@ -320,19 +348,16 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
         
         raise HTTPException(status_code=500, detail=error_msg)
 
-@router.get("/languages")
+@router.get("/languages", summary="List registered runtimes")
 async def list_languages():
-    """Return the set of runtimes the server can execute code in.
+    """Return the runtimes the server can execute code in.
 
-    Returns:
-        {
-          "languages": ["bash", "go", ...],  # names, kept for back-compat
-          "runtimes": [
-             {"name", "display_name", "file_extension",
-              "supports_packages", "package_manager"},
-             ...
-          ]
-        }
+    **Response**
+    - `languages`: array of runtime names — the authoritative list, kept
+      for back-compat with older clients.
+    - `runtimes`: array of `{name, display_name, file_extension,
+      supports_packages, package_manager}`. `supports_packages=false`
+      means the runtime has no package manager wired in (bash, go).
     """
     import languages as lang_registry
     names = lang_registry.names()
