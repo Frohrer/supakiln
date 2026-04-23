@@ -6,16 +6,11 @@ import json
 from datetime import datetime
 from models import WebhookJob, ExecutionLog
 from database import get_db
-from services.docker_client import docker_client
-from code_executor import CodeExecutor
+from services.code_executor_service import get_code_executor
 from env_manager import EnvironmentManager
 import os
-import docker
 
 router = APIRouter(prefix="/webhook", tags=["webhook-execution"])
-
-# Initialize executor
-executor = CodeExecutor()
 
 def get_env_manager():
     """Get environment manager instance."""
@@ -83,141 +78,115 @@ async def execute_webhook(path: str, request: Request, db: Session = Depends(get
             "endpoint": endpoint
         }
         
-        # Prepare the code with request context
-        # Encode the request data safely using base64
-        request_data_encoded = base64.b64encode(json.dumps(request_data).encode()).decode()
-        
-        # The webhook code will have access to 'request_data' and should set 'response_data'
-        wrapper_code = f"""
-import json
-import sys
-import base64
-from datetime import datetime
+        # Resolve language (backfill to python for rows predating the
+        # `language` column).
+        language = (getattr(job, "language", None) or "python")
 
-# Request data available to the webhook code (safely decoded from base64)
-request_data = json.loads(base64.b64decode("{request_data_encoded}").decode())
-
-# Default response
-response_data = {{"message": "Webhook executed successfully", "timestamp": datetime.now().isoformat()}}
-
-# User's webhook code
-try:
-{chr(10).join("    " + line for line in job.code.split(chr(10)))}
-except Exception as e:
-    response_data = {{"error": str(e), "timestamp": datetime.now().isoformat()}}
-    print(f"Error in webhook code: {{e}}", file=sys.stderr)
-
-# Output the response (this will be captured and returned)
-print(json.dumps(response_data))
-"""
-        
-        # Execute the webhook code
-        if job.container_id:
-            # Use existing container
-            if job.container_id not in executor.containers.values():
-                raise HTTPException(status_code=500, detail="Webhook job container not found")
-            
-            container = docker_client.containers.get(job.container_id)
+        # Build the code that will run in the worker. For Python we keep
+        # the historical contract: user code sees a `request_data` local
+        # and writes back into `response_data`. For other languages, we
+        # pass request data as SUPAKILN_REQUEST_DATA (JSON) and the user
+        # code is responsible for parsing it + printing a JSON response
+        # to stdout.
+        request_data_json = json.dumps(request_data)
+        if language == "python":
+            request_data_b64 = base64.b64encode(request_data_json.encode()).decode()
+            wrapper_code = (
+                "import json\n"
+                "import sys\n"
+                "import base64\n"
+                "from datetime import datetime\n"
+                "\n"
+                f'request_data = json.loads(base64.b64decode("{request_data_b64}").decode())\n'
+                'response_data = {"message": "Webhook executed successfully", '
+                '"timestamp": datetime.now().isoformat()}\n'
+                "\n"
+                "try:\n"
+                + "\n".join("    " + line for line in job.code.split("\n"))
+                + "\n"
+                "except Exception as e:\n"
+                '    response_data = {"error": str(e), "timestamp": datetime.now().isoformat()}\n'
+                '    print(f"Error in webhook code: {e}", file=sys.stderr)\n'
+                "\n"
+                "print(json.dumps(response_data))\n"
+            )
+            code_to_run = wrapper_code
         else:
-            # Create/get container with packages
-            packages = []
-            if job.packages and job.packages.strip():
-                packages = [pkg.strip() for pkg in job.packages.split(',') if pkg.strip()]
-            
-            package_hash = executor._get_package_hash(packages)
-            image_tag = executor._build_image(packages)
-            
-            if package_hash not in executor.containers:
-                # Get network mode from environment variable (defaults to 'none' for security)
-                container_network_mode = os.environ.get('CONTAINER_NETWORK_MODE', 'none')
-                
-                container = docker_client.containers.run(
-                    image_tag,
-                    detach=True,
-                    tty=True,
-                    mem_limit="512m",
-                    cpu_period=100000,
-                    cpu_quota=50000,
-                    user="1000:1000",
-                    network_mode=container_network_mode,  # Configurable network mode
-                    cap_drop=["ALL"],  # Remove all capabilities
-                    pids_limit=100  # Limit number of processes (keep reasonable limit)
-                )
-                executor.containers[package_hash] = container.id
-            
-            container_id = executor.containers[package_hash]
-            container = docker_client.containers.get(container_id)
-        
-        # Get environment variables
+            # No auto-wrapping for non-Python; user emits JSON to stdout.
+            code_to_run = job.code
+
+        # Packages from the stored comma-separated string.
+        packages: list = []
+        if job.packages and job.packages.strip():
+            packages = [pkg.strip() for pkg in job.packages.split(",") if pkg.strip()]
+
+        # Environment variables: user's encrypted secrets + request data
+        # for non-Python languages.
         env_manager = get_env_manager()
-        env_vars = env_manager.get_all_variables()
-        
-        # Execute with timeout (support infinite timeout with -1)
-        encoded_code = base64.b64encode(wrapper_code.encode()).decode()
-        
-        if job.timeout == -1:
-            # Infinite timeout - no timeout command
-            exec_command = f"python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'"
-        else:
-            # Normal timeout
-            exec_command = f"timeout {job.timeout} python -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'"
-        
-        result = container.exec_run(
-            exec_command,
-            environment=env_vars
+        env_vars = dict(env_manager.get_all_variables())
+        if language != "python":
+            env_vars["SUPAKILN_REQUEST_DATA"] = request_data_json
+
+        # -1 means "no timeout"; treat as a very large number of seconds.
+        timeout_s = 60 * 60 * 24 if job.timeout == -1 else int(job.timeout)
+
+        exec_result = get_code_executor().execute_code(
+            code=code_to_run,
+            packages=packages,
+            timeout=timeout_s,
+            env_vars=env_vars,
+            language=language,
         )
-        
-        # Parse the output
-        success = result.exit_code == 0
-        output = result.output.decode() if result.output else ""
-        
-        # Try to parse the response data from output
+
+        success = bool(exec_result.get("success"))
+        output = (exec_result.get("output") or "")
+        error_output = exec_result.get("error") or ""
+        container_id = exec_result.get("container_id")
+
+        # Parse the last JSON-shaped line of stdout as the response body.
         response_data = None
-        if success and output.strip():
-            try:
-                # The last line should be the JSON response
-                lines = output.strip().split('\n')
-                for line in reversed(lines):
-                    line = line.strip()
-                    if line.startswith('{') and line.endswith('}'):
+        if output.strip():
+            for line in reversed(output.strip().splitlines()):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
                         response_data = json.loads(line)
                         break
-            except Exception as e:
-                print(f"Error parsing webhook response: {e}")
-                response_data = {"output": output}
-        
-        if not response_data:
+                    except json.JSONDecodeError:
+                        continue
+        if response_data is None:
             response_data = {
                 "success": success,
-                "output": output if success else None,
-                "error": output if not success else None
+                "output": output or None,
+                "error": error_output or None,
             }
-        
+
         # Update job last triggered time
         job.last_triggered = datetime.utcnow()
         db.commit()
-        
+
         # Log the execution
         log = ExecutionLog(
             webhook_job_id=job.id,
             code=job.code,
             output=json.dumps(response_data) if success else None,
-            error=output if not success else None,
-            container_id=container.id,
+            error=error_output if not success else None,
+            container_id=container_id,
             execution_time=time.time() - start_time,
             started_at=datetime.utcnow(),
             status="success" if success else "error",
-            request_data=json.dumps(request_data),
-            response_data=json.dumps(response_data) if success else None
+            request_data=request_data_json,
+            response_data=json.dumps(response_data) if success else None,
         )
         db.add(log)
         db.commit()
-        
-        # Return the response
+
         if success:
             return response_data
-        else:
-            raise HTTPException(status_code=500, detail=response_data.get("error", "Webhook execution failed"))
+        raise HTTPException(
+            status_code=500,
+            detail=response_data.get("error") or error_output or "Webhook execution failed",
+        )
             
     except HTTPException:
         raise

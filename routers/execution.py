@@ -235,18 +235,30 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
             # Use the CodeExecutor.execute_code method which handles web service detection
             if not request.packages:
                 request.packages = []
-            
+
+            # Validate language up front so we can 400 instead of
+            # bubbling up the KeyError as a 500.
+            import languages as lang_registry
+            language = request.language or "python"
+            try:
+                lang_registry.get(language)
+            except KeyError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unknown language {language!r}; known: {lang_registry.names()}",
+                )
+
             # Get environment variables
             env_manager = get_env_manager()
             env_vars = env_manager.get_all_variables()
-            
+
             # Use the proper executor method
             result = get_code_executor().execute_code(
                 code=request.code,
                 packages=request.packages,
                 timeout=request.timeout or 30,
                 env_vars=env_vars,
-                language=request.language or "python",
+                language=language,
             )
             
             # Log the execution

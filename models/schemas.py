@@ -33,6 +33,7 @@ class ScheduledJobRequest(BaseModel):
 class ScheduledJobResponse(BaseModel):
     id: int
     name: str
+    code: Optional[str] = None
     cron_expression: str
     container_id: Optional[str]
     packages: Optional[str]
@@ -40,6 +41,7 @@ class ScheduledJobResponse(BaseModel):
     last_run: Optional[str]
     is_active: bool
     timeout: int
+    language: Optional[str] = "python"
 
 class ExecutionLogResponse(BaseModel):
     id: int
@@ -93,6 +95,7 @@ class WebhookJobResponse(BaseModel):
     is_active: bool
     timeout: int
     description: Optional[str]
+    language: Optional[str] = "python"
 
 class PersistentServiceRequest(BaseModel):
     name: str

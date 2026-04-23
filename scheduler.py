@@ -84,7 +84,8 @@ class JobScheduler:
                 result = self.executor.execute_code(
                     code=job.code,
                     packages=job.packages.split(',') if job.packages else [],
-                    timeout=getattr(job, 'timeout', 30)  # Use job timeout or default to 30
+                    timeout=getattr(job, 'timeout', 30),
+                    language=getattr(job, 'language', None) or 'python',
                 )
                 
                 execution_time = time.time() - start_time
@@ -121,7 +122,7 @@ class JobScheduler:
         finally:
             db.close()
 
-    def add_job(self, name, code, cron_expression, container_id=None, packages=None):
+    def add_job(self, name, code, cron_expression, container_id=None, packages=None, language="python", timeout=30):
         """Add a new scheduled job."""
         db = SessionLocal()
         try:
@@ -130,12 +131,14 @@ class JobScheduler:
                 code=code,
                 cron_expression=cron_expression,
                 container_id=container_id,
-                packages=','.join(packages) if packages else None
+                packages=','.join(packages) if packages else None,
+                language=language or "python",
+                timeout=timeout,
             )
             db.add(job)
             db.commit()
             db.refresh(job)
-            
+
             self.schedule_job(job)
             return job
         finally:
