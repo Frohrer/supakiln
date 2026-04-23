@@ -4,6 +4,12 @@ import { Add as AddIcon, Delete as DeleteIcon, PlayArrow as PlayIcon, Launch as 
 import Editor from '@monaco-editor/react';
 import api, { extractErrorMessage } from '../config/api';
 import { Runtime, fetchRuntimes, monacoLanguageFor } from '../config/languages';
+import {
+  APP_TEMPLATES,
+  templatesForLanguage,
+  defaultTemplateForLanguage,
+  templateByKey,
+} from '../config/templates';
 
 interface CodeSession {
   id: string;
@@ -20,184 +26,15 @@ interface WebService {
   proxy_url: string;
 }
 
-const appTemplates = {
-  basic: {
-    name: 'Basic Python',
-    packages: [],
-    code: `# Write your Python code here
-import os
-
-# Example 1: Get environment variable with default value
-database_url = os.getenv('DATABASE_URL', 'sqlite:///default.db')
-print(f"Database URL: {database_url}")
-
-# Example 2: Get required environment variable (raises error if not found)
-try:
-    api_key = os.environ['API_KEY']
-    print(f"API Key found: {api_key[:8]}...")
-except KeyError:
-    print("API_KEY environment variable not set")
-
-# Example 3: Get environment variable with type conversion
-debug_mode = os.getenv('DEBUG', 'false').lower() == 'true'
-print(f"Debug mode: {debug_mode}")
-
-# Example 4: List all environment variables
-print("\\nAll environment variables:")
-for key, value in os.environ.items():
-    print(f"{key}: {value}")
-
-print("Hello, World!")`
-  },
-  gradio: {
-    name: 'Gradio App',
-    packages: ['gradio'],
-    code: `import gradio as gr
-
-def greet(name):
-    return f"Hello, {name}!"
-
-with gr.Blocks() as demo:
-    inp = gr.Textbox(label="Your name")
-    out = gr.Textbox(label="Greeting")
-    btn = gr.Button("Greet")
-    btn.click(fn=greet, inputs=inp, outputs=out)
-
-if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
-`
-  },
-  fastapi: {
-    name: 'FastAPI App',
-    packages: ['fastapi', 'uvicorn'],
-    code: `from fastapi import FastAPI
-import uvicorn
-
-app = FastAPI(title="My API", description="A simple FastAPI application")
-
-@app.get("/")
-def read_root():
-    return {"message": "Hello World", "status": "running"}
-
-@app.get("/items/{item_id}")
-def read_item(item_id: int, q: str = None):
-    return {"item_id": item_id, "q": q}
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
-
-if __name__ == "__main__":
-    # This will start the server
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-`
-  },
-  flask: {
-    name: 'Flask App',
-    packages: ['flask'],
-    code: `from flask import Flask, jsonify, render_template_string
-
-app = Flask(__name__)
-
-# Simple HTML template
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>My Flask App</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        .container { max-width: 600px; margin: 0 auto; }
-        h1 { color: #333; }
-        .btn { background: #007bff; color: white; padding: 10px 20px; 
-               text-decoration: none; border-radius: 5px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Welcome to My Flask App!</h1>
-        <p>This is a simple Flask application.</p>
-        <a href="/api/data" class="btn">View API Data</a>
-    </div>
-</body>
-</html>
-'''
-
-@app.route('/')
-def home():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/data')
-def get_data():
-    return jsonify({
-        "message": "Hello from Flask!",
-        "data": [1, 2, 3, 4, 5],
-        "status": "success"
-    })
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
-`
-  },
-  dash: {
-    name: 'Dash App',
-    packages: ['dash', 'plotly', 'pandas', 'numpy'],
-    code: `import dash
-from dash import dcc, html, Input, Output
-import plotly.express as px
-import pandas as pd
-
-# Create sample data
-df = pd.DataFrame({
-    'Fruit': ['Apples', 'Oranges', 'Bananas', 'Grapes'],
-    'Amount': [4, 1, 2, 3],
-    'City': ['SF', 'SF', 'NYC', 'NYC']
-})
-
-# Initialize the Dash app
-app = dash.Dash(__name__)
-
-# Define the layout
-app.layout = html.Div([
-    html.H1("My Dash Application", style={'textAlign': 'center'}),
-    
-    html.Div([
-        html.Label("Select City:"),
-        dcc.Dropdown(
-            id='city-dropdown',
-            options=[{'label': city, 'value': city} for city in df['City'].unique()],
-            value='SF'
-        )
-    ], style={'width': '48%', 'display': 'inline-block'}),
-    
-    dcc.Graph(id='fruit-graph'),
-    
-    html.Div([
-        html.H3("Sample Text"),
-        html.P("This is a sample Dash application with interactive components!")
-    ])
-])
-
-# Callback for updating the graph
-@app.callback(
-    Output('fruit-graph', 'figure'),
-    Input('city-dropdown', 'value')
-)
-def update_graph(selected_city):
-    filtered_df = df[df['City'] == selected_city]
-    fig = px.bar(filtered_df, x='Fruit', y='Amount', 
-                 title=f'Fruit Amount in {selected_city}')
-    return fig
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8050, debug=True)
-`
-  }
-};
+// Templates now live in config/templates.ts (one flat list, per-language).
+// The "Basic Python" template is the conventional blank-slate starting
+// point; kept around as a named constant so the auto-save guard below
+// doesn't flag it as user content.
+const BASIC_PYTHON = APP_TEMPLATES.find((t) => t.key === 'python-basic')!;
 
 const CodeEditor: React.FC = () => {
-  const [selectedTemplate, setSelectedTemplate] = useState('basic');
-  const [code, setCode] = useState(appTemplates.basic.code);
+  const [selectedTemplate, setSelectedTemplate] = useState('python-basic');
+  const [code, setCode] = useState(BASIC_PYTHON.code);
   const [packages, setPackages] = useState<string[]>(['']);
   const [output, setOutput] = useState<string>('');
   const [isScheduled, setIsScheduled] = useState(false);
@@ -235,7 +72,7 @@ const CodeEditor: React.FC = () => {
   // Auto-save current editor state to localStorage
   useEffect(() => {
     // Only auto-save if not currently loading a template or session
-    if (code && code !== appTemplates.basic.code) {
+    if (code && code !== BASIC_PYTHON.code) {
       saveAutoSavedState();
     }
   }, [code, packages]);
@@ -304,16 +141,37 @@ const CodeEditor: React.FC = () => {
   };
 
   const handleTemplateChange = (templateKey: string) => {
-    const template = appTemplates[templateKey as keyof typeof appTemplates];
+    const template = templateByKey(templateKey);
+    if (!template) return;
     setSelectedTemplate(templateKey);
     setCode(template.code);
-    setPackages(template.packages.length > 0 ? template.packages : ['']);
+    setPackages(template.packages.length > 0 ? [...template.packages] : ['']);
+    // A template carries its own language — switching template also
+    // switches the runtime so Monaco's syntax highlighting and the
+    // /execute request body both stay consistent.
+    if (template.language !== language) {
+      setLanguage(template.language);
+    }
     setWebService(null);
     setCurrentSessionId(null);
     setSelectedSession('');
-    // Clear auto-saved state when loading a template
     clearAutoSavedState();
   };
+
+  // When the language changes (either directly or via a template), make
+  // sure the template dropdown points at a template that belongs to the
+  // new language. Otherwise the dropdown shows an out-of-list value and
+  // the displayed label mismatches the selected runtime.
+  useEffect(() => {
+    const current = templateByKey(selectedTemplate);
+    if (current && current.language === language) return;
+    const fallback = defaultTemplateForLanguage(language);
+    setSelectedTemplate(fallback ? fallback.key : '');
+    // Intentionally don't reset `code` here — the user may be typing in
+    // a language we just switched to. Templates are a scaffolding aid,
+    // not a source of truth for the current buffer.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [language]);
 
   const handleSessionLoad = (sessionId: string) => {
     const session = codeSessions.find((s: CodeSession) => s.id === sessionId);
@@ -489,16 +347,22 @@ const CodeEditor: React.FC = () => {
         <TextField
           select
           size="small"
-          label="App Template"
+          label="Template"
           value={selectedTemplate}
           onChange={(e) => handleTemplateChange(e.target.value)}
           sx={{ minWidth: 200 }}
         >
-          {Object.entries(appTemplates).map(([key, template]) => (
-            <MenuItem key={key} value={key}>
-              {template.name}
+          {templatesForLanguage(language).length === 0 ? (
+            <MenuItem value="" disabled>
+              <em>No templates for this runtime</em>
             </MenuItem>
-          ))}
+          ) : (
+            templatesForLanguage(language).map((template) => (
+              <MenuItem key={template.key} value={template.key}>
+                {template.name}
+              </MenuItem>
+            ))
+          )}
         </TextField>
         
         <TextField
