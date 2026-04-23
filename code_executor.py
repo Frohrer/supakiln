@@ -88,7 +88,6 @@ class CodeExecutor:
         self.container_network_mode = os.environ.get('CONTAINER_NETWORK_MODE', 'none')
         print(f"🔒 Container network mode: {self.container_network_mode}")
         self._base_image_ready = False
-        self._runtime_images_ready: Dict[str, bool] = {}
         
     def _run_docker_command(self, command: List[str], timeout: int = 30) -> Tuple[bool, str, Optional[str]]:
         """Run a Docker command and return (success, output, error)."""
@@ -313,20 +312,25 @@ USER codeuser
     # ------------------------------------------------------------------
 
     def _ensure_runtime_base_image(self, runtime: Runtime) -> None:
-        """Build the runtime's base image if it isn't already present."""
-        if self._runtime_images_ready.get(runtime.name):
-            return
+        """Build the runtime's base image if it isn't already present.
+
+        We always hit `docker image inspect` here — caching "ready=True"
+        in-process lets an image get deleted externally (by `docker rmi`,
+        GC, or a cleanup sweep) and leaves us with a stale Yes that
+        fails on the next `docker run`. The inspect is ~5ms, cheap
+        enough to do on the cold-start path.
+        """
         tag = runtime.base_image_tag
         success, _, _ = self._run_docker_command(["docker", "image", "inspect", tag])
+        if success:
+            return
+        print(f"Building {tag} from {runtime.dockerfile_path}...")
+        success, _, error = self._run_docker_command(
+            ["docker", "build", "-t", tag, "-f", runtime.dockerfile_path, "."],
+            timeout=600,
+        )
         if not success:
-            print(f"Building {tag} from {runtime.dockerfile_path}...")
-            success, _, error = self._run_docker_command(
-                ["docker", "build", "-t", tag, "-f", runtime.dockerfile_path, "."],
-                timeout=600,
-            )
-            if not success:
-                raise Exception(f"Failed to build {tag}: {error}")
-        self._runtime_images_ready[runtime.name] = True
+            raise Exception(f"Failed to build {tag}: {error}")
 
     def _build_runtime_image(self, runtime: Runtime, packages: List[str]) -> str:
         """Return an image tag for `runtime + packages`, building if needed."""
