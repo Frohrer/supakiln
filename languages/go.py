@@ -12,5 +12,8 @@ GO = Runtime(
     base_image_tag="supakiln-go:base",
     dockerfile_path="dockerfiles/go.Dockerfile",
     package_install_cmd_template=None,
+    file_extension=".go",
+    display_name="Go",
+    package_manager=None,
     worker_port=9999,
 )

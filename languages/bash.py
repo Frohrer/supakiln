@@ -9,5 +9,8 @@ BASH = Runtime(
     base_image_tag="supakiln-bash:base",
     dockerfile_path="dockerfiles/bash.Dockerfile",
     package_install_cmd_template=None,
+    file_extension=".sh",
+    display_name="Bash",
+    package_manager=None,
     worker_port=9999,
 )

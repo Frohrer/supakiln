@@ -10,5 +10,8 @@ RUBY = Runtime(
     # System-wide gem install; user code `require "gem"` resolves via
     # Ruby's default load paths.
     package_install_cmd_template="gem install --no-document {packages}",
+    file_extension=".rb",
+    display_name="Ruby",
+    package_manager="gem",
     worker_port=9999,
 )

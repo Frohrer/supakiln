@@ -59,6 +59,10 @@ services:
       - ENVIRONMENT=${ENVIRONMENT:-production}
       # Container security settings
       - CONTAINER_NETWORK_MODE=${CONTAINER_NETWORK_MODE:-none}  # 'none' for isolation, 'bridge' for network access
+      # Worker lifecycle tuning — see README/docs.
+      - SUPAKILN_WORKER_IDLE_TTL_SECONDS=${SUPAKILN_WORKER_IDLE_TTL_SECONDS:-1800}
+      - SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS=${SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS:-60}
+      - SUPAKILN_CONTAINER_TMPFS_SIZE=${SUPAKILN_CONTAINER_TMPFS_SIZE:-128m}
     depends_on:
       docker-daemon:
         condition: service_healthy 

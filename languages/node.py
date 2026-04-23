@@ -10,5 +10,8 @@ NODE = Runtime(
     # Install into a fixed prefix; the base image sets NODE_PATH so user
     # code's require() resolves to these modules.
     package_install_cmd_template="cd /opt/supakiln/pkgs && npm install --no-audit --no-fund {packages}",
+    file_extension=".js",
+    display_name="Node.js",
+    package_manager="npm",
     worker_port=9999,
 )

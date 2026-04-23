@@ -22,6 +22,7 @@ class JobScheduler:
         if not self._initialized:
             self.load_existing_jobs()
             self._schedule_cleanup_job()
+            self._schedule_worker_reaper()
             self._initialized = True
 
     def _schedule_cleanup_job(self):
@@ -41,6 +42,50 @@ class JobScheduler:
             replace_existing=True,
         )
         logger.info("Scheduled periodic cleanup job (every 6 hours)")
+
+    def _schedule_worker_reaper(self):
+        """Periodically kill ad-hoc workers that have been idle too long.
+
+        Configured by two env vars:
+          SUPAKILN_WORKER_IDLE_TTL_SECONDS  reap threshold; <=0 disables.
+                                            Default 1800 (30 minutes).
+          SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS  how often to scan.
+                                                   Default 60.
+        """
+        import os
+        from services.code_executor_service import get_code_executor
+
+        try:
+            idle_ttl = float(os.environ.get("SUPAKILN_WORKER_IDLE_TTL_SECONDS", "1800"))
+        except ValueError:
+            idle_ttl = 1800
+        try:
+            interval = float(os.environ.get("SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS", "60"))
+        except ValueError:
+            interval = 60
+
+        if idle_ttl <= 0:
+            logger.info("Worker idle reaper disabled (SUPAKILN_WORKER_IDLE_TTL_SECONDS <= 0)")
+            return
+
+        def _reap_wrapper():
+            try:
+                reaped = get_code_executor().reap_idle_workers(idle_ttl)
+                if reaped:
+                    logger.info("Reaped %d idle worker(s): %s", len(reaped), reaped)
+            except Exception:
+                logger.exception("Worker reaper failed")
+
+        self.scheduler.add_job(
+            _reap_wrapper,
+            IntervalTrigger(seconds=interval),
+            id="__worker_reaper",
+            replace_existing=True,
+        )
+        logger.info(
+            "Scheduled worker idle reaper (ttl=%.0fs, interval=%.0fs)",
+            idle_ttl, interval,
+        )
 
     def load_existing_jobs(self):
         """Load all active jobs from the database and schedule them."""

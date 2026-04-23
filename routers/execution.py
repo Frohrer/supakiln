@@ -322,9 +322,31 @@ async def execute_code(request: CodeExecutionRequest, db: Session = Depends(get_
 
 @router.get("/languages")
 async def list_languages():
-    """Return the set of runtimes the server can execute code in."""
+    """Return the set of runtimes the server can execute code in.
+
+    Returns:
+        {
+          "languages": ["bash", "go", ...],  # names, kept for back-compat
+          "runtimes": [
+             {"name", "display_name", "file_extension",
+              "supports_packages", "package_manager"},
+             ...
+          ]
+        }
+    """
     import languages as lang_registry
-    return {"languages": lang_registry.names()}
+    names = lang_registry.names()
+    runtimes = []
+    for n in names:
+        rt = lang_registry.get(n)
+        runtimes.append({
+            "name": rt.name,
+            "display_name": rt.display_name or rt.name.title(),
+            "file_extension": rt.file_extension,
+            "supports_packages": rt.supports_packages,
+            "package_manager": rt.package_manager,
+        })
+    return {"languages": names, "runtimes": runtimes}
 
 
 @router.get("/debug/containers")

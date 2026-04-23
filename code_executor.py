@@ -68,6 +68,10 @@ class CodeExecutor:
         self.worker_containers: Dict[str, str] = {}
         # Worker endpoints: container_id -> (host, port) to reach its HTTP API
         self.worker_endpoints: Dict[str, Tuple[str, int]] = {}
+        # Per-container metadata the lifecycle API surfaces: language,
+        # package_hash, cache_key, created_at, last_used. Updated on
+        # creation and on every /exec call.
+        self.worker_meta: Dict[str, Dict] = {}
         # HTTP session with connection pooling so each /exec POST reuses a
         # TCP connection to the worker when possible.
         self._http = requests.Session()
@@ -414,6 +418,7 @@ USER codeuser
             cur = self.worker_endpoints.get(container_id)
             if cur is not None:
                 self.worker_endpoints.pop(container_id, None)
+            self.worker_meta.pop(container_id, None)
             if self.containers.get(cache_key) == container_id:
                 self.containers.pop(cache_key, None)
             try:
@@ -507,6 +512,14 @@ USER codeuser
 
             self.worker_containers[cache_key] = container_id
             self.worker_endpoints[container_id] = (host, host_port)
+            now = time.time()
+            self.worker_meta[container_id] = {
+                "language": runtime.name,
+                "package_hash": package_hash,
+                "cache_key": cache_key,
+                "created_at": now,
+                "last_used": now,
+            }
             # Also register in the legacy `containers` dict so existing code
             # (debug endpoints, container_id lookups) still works.
             self.containers[cache_key] = container_id
@@ -1142,6 +1155,10 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                     timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
                     if attempt == 1:
                         timings['self_heal_recovered'] = 1.0
+                    # Record liveness for lifecycle + idle reaper.
+                    meta = self.worker_meta.get(container_id)
+                    if meta is not None:
+                        meta["last_used"] = time.time()
                     break
                 except WorkerUnreachableError as e:
                     last_unreachable = e
@@ -1195,6 +1212,76 @@ export PYTHONPATH=/tmp:$PYTHONPATH
         self.web_service_containers.clear()
         self.worker_containers.clear()
         self.worker_endpoints.clear()
+        self.worker_meta.clear()
+
+    # ------------------------------------------------------------------
+    # Lifecycle API used by the /workers router and the idle reaper.
+    # ------------------------------------------------------------------
+
+    def list_workers(self) -> List[Dict]:
+        """Return a snapshot of live ad-hoc workers."""
+        out: List[Dict] = []
+        for container_id, meta in list(self.worker_meta.items()):
+            endpoint = self.worker_endpoints.get(container_id)
+            out.append({
+                "container_id": container_id,
+                "language": meta["language"],
+                "package_hash": meta["package_hash"],
+                "cache_key": meta["cache_key"],
+                "created_at": meta["created_at"],
+                "last_used": meta["last_used"],
+                "host": endpoint[0] if endpoint else None,
+                "port": endpoint[1] if endpoint else None,
+            })
+        # Stable order for UIs.
+        out.sort(key=lambda w: (w["language"], w["created_at"]))
+        return out
+
+    def stop_worker(self, container_id: str) -> bool:
+        """Force-kill one worker. Returns True if it was tracked."""
+        meta = self.worker_meta.get(container_id)
+        if meta is None:
+            # Still try to kill the container in case it's a stale one we
+            # lost track of after a backend restart.
+            try:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_id],
+                    capture_output=True, env=os.environ.copy(), timeout=15,
+                )
+            except Exception:
+                pass
+            return False
+        self._evict_worker(meta["cache_key"], container_id)
+        return True
+
+    def reset_workers(self) -> int:
+        """Stop and forget every tracked ad-hoc worker. Returns count killed."""
+        killed = 0
+        for container_id in list(self.worker_meta.keys()):
+            meta = self.worker_meta.get(container_id)
+            if meta is None:
+                continue
+            self._evict_worker(meta["cache_key"], container_id)
+            killed += 1
+        return killed
+
+    def reap_idle_workers(self, idle_ttl_seconds: float) -> List[str]:
+        """Stop workers whose last_used is older than idle_ttl_seconds.
+
+        Returns the list of container_ids that were reaped. idle_ttl <= 0
+        disables reaping (caller should skip invoking altogether in that
+        case, but we also guard here).
+        """
+        if idle_ttl_seconds <= 0:
+            return []
+        now = time.time()
+        cutoff = now - idle_ttl_seconds
+        reaped: List[str] = []
+        for container_id, meta in list(self.worker_meta.items()):
+            if meta["last_used"] < cutoff:
+                self._evict_worker(meta["cache_key"], container_id)
+                reaped.append(container_id)
+        return reaped
 
     def shutdown(self):
         """Graceful shutdown: stop and remove all tracked containers."""

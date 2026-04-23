@@ -24,9 +24,16 @@ class Runtime:
     #   of packages. `{packages}` is substituted with the shell-quoted
     #   package list. None means this runtime does not support ad-hoc
     #   packages (e.g. bash).
+    file_extension: str = ""          # ".py", ".js", ".sh", ...
+    display_name: str = ""            # "Python", "Node.js", ... (defaults to name.title())
+    package_manager: Optional[str] = None  # "pip", "npm", "gem", None
     worker_port: int = 9999
     # The worker's HTTP contract is identical across languages; only the
     # implementation (the binary invoked by the Dockerfile's CMD) differs.
+
+    @property
+    def supports_packages(self) -> bool:
+        return self.package_install_cmd_template is not None
 
 
 def build_package_install_snippet(runtime: Runtime, packages: List[str]) -> str:
