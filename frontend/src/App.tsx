@@ -9,6 +9,7 @@ import Logs from './pages/Logs';
 import SavedCode from './pages/Containers';
 import RunningContainers from './pages/RunningContainers';
 import EnvironmentVariables from './pages/EnvironmentVariables';
+import Workers from './pages/Workers';
 
 const theme = createTheme({
   palette: {
@@ -34,6 +35,7 @@ function App() {
             <Route path="/containers" element={<RunningContainers />} />
             <Route path="/scheduler" element={<Scheduler />} />
             <Route path="/webhooks" element={<WebhookJobs />} />
+            <Route path="/workers" element={<Workers />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/env" element={<EnvironmentVariables />} />
           </Routes>

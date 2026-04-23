@@ -3,6 +3,7 @@ import { Box, Grid, Paper, Typography, Button, TextField, IconButton, Switch, Fo
 import { Add as AddIcon, Delete as DeleteIcon, PlayArrow as PlayIcon, Launch as LaunchIcon, Save as SaveIcon, Folder as FolderIcon } from '@mui/icons-material';
 import Editor from '@monaco-editor/react';
 import api, { extractErrorMessage } from '../config/api';
+import { Runtime, fetchRuntimes, monacoLanguageFor } from '../config/languages';
 
 interface CodeSession {
   id: string;
@@ -214,11 +215,22 @@ const CodeEditor: React.FC = () => {
   const [sessionName, setSessionName] = useState('');
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
 
+  // Language / runtime selection
+  const [runtimes, setRuntimes] = useState<Runtime[]>([]);
+  const [language, setLanguage] = useState<string>('python');
+
   useEffect(() => {
     loadCodeSessions();
     // Load auto-saved editor state on mount
     loadAutoSavedState();
+    // Load available runtimes from the backend
+    fetchRuntimes()
+      .then((rts) => setRuntimes(rts))
+      .catch((err) => console.error('Error fetching runtimes:', err));
   }, []);
+
+  const currentRuntime = runtimes.find((r) => r.name === language);
+  const supportsPackages = currentRuntime ? currentRuntime.supports_packages : true;
 
   // Auto-save current editor state to localStorage
   useEffect(() => {
@@ -390,8 +402,9 @@ const CodeEditor: React.FC = () => {
           name: scheduleName,
           code,
           cron_expression: cronExpression,
-          packages: packages.filter(p => p.trim() !== ''),
+          packages: supportsPackages ? packages.filter(p => p.trim() !== '') : [],
           timeout: timeout,
+          language,
         });
         const endTime = Date.now();
         const execTime = endTime - startTime;
@@ -401,8 +414,9 @@ const CodeEditor: React.FC = () => {
         // Execute code immediately
         const response = await api.post('/execute', {
           code,
-          packages: packages.filter(p => p.trim() !== ''),
+          packages: supportsPackages ? packages.filter(p => p.trim() !== '') : [],
           timeout: timeout,
+          language,
         });
         const endTime = Date.now();
         const execTime = endTime - startTime;
@@ -453,6 +467,25 @@ const CodeEditor: React.FC = () => {
           {currentSessionId ? 'Update' : 'Save'}
         </Button>
         
+        <TextField
+          select
+          size="small"
+          label="Language"
+          value={language}
+          onChange={(e) => setLanguage(e.target.value)}
+          sx={{ minWidth: 140 }}
+        >
+          {runtimes.length === 0 ? (
+            <MenuItem value="python">Python</MenuItem>
+          ) : (
+            runtimes.map((rt) => (
+              <MenuItem key={rt.name} value={rt.name}>
+                {rt.display_name}
+              </MenuItem>
+            ))
+          )}
+        </TextField>
+
         <TextField
           select
           size="small"
@@ -517,7 +550,7 @@ const CodeEditor: React.FC = () => {
           <Paper sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
             <Editor
               height="100%"
-              defaultLanguage="python"
+              language={monacoLanguageFor(language)}
               value={code}
               onChange={(value) => setCode(value || '')}
               theme="vs-dark"
@@ -546,7 +579,7 @@ const CodeEditor: React.FC = () => {
           <Paper sx={{ p: 2 }}>
             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
               <Typography variant="h6">
-                Packages
+                {supportsPackages ? 'Packages' : 'Settings'}
               </Typography>
               {currentSessionId && (
                 <Typography variant="caption" color="primary">
@@ -554,32 +587,45 @@ const CodeEditor: React.FC = () => {
                 </Typography>
               )}
             </Box>
-            {packages.map((package_, index) => (
-              <Box key={index} sx={{ display: 'flex', mb: 1 }}>
-                <TextField
-                  fullWidth
+            {supportsPackages ? (
+              <>
+                {currentRuntime?.package_manager && (
+                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1 }}>
+                    Managed with {currentRuntime.package_manager}
+                  </Typography>
+                )}
+                {packages.map((package_, index) => (
+                  <Box key={index} sx={{ display: 'flex', mb: 1 }}>
+                    <TextField
+                      fullWidth
+                      size="small"
+                      value={package_}
+                      onChange={(e) => handlePackageChange(index, e.target.value)}
+                      placeholder="Package name"
+                    />
+                    <IconButton
+                      size="small"
+                      onClick={() => handleRemovePackage(index)}
+                      sx={{ ml: 1 }}
+                    >
+                      <DeleteIcon />
+                    </IconButton>
+                  </Box>
+                ))}
+                <Button
+                  startIcon={<AddIcon />}
+                  onClick={handleAddPackage}
                   size="small"
-                  value={package_}
-                  onChange={(e) => handlePackageChange(index, e.target.value)}
-                  placeholder="Package name"
-                />
-                <IconButton
-                  size="small"
-                  onClick={() => handleRemovePackage(index)}
-                  sx={{ ml: 1 }}
+                  sx={{ mt: 1 }}
                 >
-                  <DeleteIcon />
-                </IconButton>
-              </Box>
-            ))}
-            <Button
-              startIcon={<AddIcon />}
-              onClick={handleAddPackage}
-              size="small"
-              sx={{ mt: 1 }}
-            >
-              Add Package
-            </Button>
+                  Add Package
+                </Button>
+              </>
+            ) : (
+              <Typography variant="body2" color="text.secondary">
+                {currentRuntime?.display_name || language} does not support package installation.
+              </Typography>
+            )}
 
             {/* Timeout Settings */}
             <Box sx={{ mt: 2 }}>

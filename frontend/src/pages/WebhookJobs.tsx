@@ -36,6 +36,7 @@ import {
   Code as CodeIcon,
 } from '@mui/icons-material';
 import api, { extractErrorMessage } from '../config/api';
+import { Runtime, fetchRuntimes } from '../config/languages';
 
 interface WebhookJob {
   id: number;
@@ -49,6 +50,7 @@ interface WebhookJob {
   last_triggered: string | null;
   is_active: boolean;
   created_at: string;
+  language?: string;
 }
 
 interface Container {
@@ -66,6 +68,7 @@ interface WebhookJobForm {
   timeout: number;
   description: string;
   is_active: boolean;
+  language: string;
 }
 
 const WebhookJobs: React.FC = () => {
@@ -78,6 +81,7 @@ const WebhookJobs: React.FC = () => {
   const [error, setError] = useState<string>('');
   const [success, setSuccess] = useState<string>('');
   const [tabValue, setTabValue] = useState(0);
+  const [runtimes, setRuntimes] = useState<Runtime[]>([]);
 
   const [formData, setFormData] = useState<WebhookJobForm>({
     name: '',
@@ -88,6 +92,7 @@ const WebhookJobs: React.FC = () => {
     timeout: 30,
     description: '',
     is_active: true,
+    language: 'python',
   });
 
   const fetchJobs = async () => {
@@ -112,6 +117,9 @@ const WebhookJobs: React.FC = () => {
   useEffect(() => {
     fetchJobs();
     fetchContainers();
+    fetchRuntimes()
+      .then((rts) => setRuntimes(rts))
+      .catch((err) => console.error('Error fetching runtimes:', err));
   }, []);
 
   const handleCreate = () => {
@@ -124,6 +132,7 @@ const WebhookJobs: React.FC = () => {
       timeout: 30,
       description: '',
       is_active: true,
+      language: 'python',
     });
     setIsEditing(false);
     setIsFormDialogOpen(true);
@@ -139,6 +148,7 @@ const WebhookJobs: React.FC = () => {
       timeout: job.timeout,
       description: job.description || '',
       is_active: job.is_active,
+      language: job.language || 'python',
     });
     setSelectedJob(job);
     setIsEditing(true);
@@ -261,6 +271,7 @@ const WebhookJobs: React.FC = () => {
                 <TableRow>
                   <TableCell>Name</TableCell>
                   <TableCell>Endpoint</TableCell>
+                  <TableCell>Language</TableCell>
                   <TableCell>Status</TableCell>
                   <TableCell>Last Triggered</TableCell>
                   <TableCell>Timeout</TableCell>
@@ -291,6 +302,9 @@ const WebhookJobs: React.FC = () => {
                           {getWebhookUrl(job.endpoint)}
                         </Typography>
                       </Box>
+                    </TableCell>
+                    <TableCell>
+                      <Chip label={job.language || 'python'} size="small" variant="outlined" />
                     </TableCell>
                     <TableCell>
                       <Chip
@@ -341,7 +355,7 @@ const WebhookJobs: React.FC = () => {
                 ))}
                 {jobs.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={6} align="center">
+                    <TableCell colSpan={7} align="center">
                       <Typography color="text.secondary">
                         No webhook jobs found. Create your first webhook!
                       </Typography>
@@ -398,6 +412,24 @@ const WebhookJobs: React.FC = () => {
                   multiline
                   rows={2}
                 />
+                <FormControl fullWidth>
+                  <InputLabel>Language</InputLabel>
+                  <Select
+                    value={formData.language}
+                    label="Language"
+                    onChange={(e) => handleFormChange('language', e.target.value)}
+                  >
+                    {runtimes.length === 0 ? (
+                      <MenuItem value="python">Python</MenuItem>
+                    ) : (
+                      runtimes.map((rt) => (
+                        <MenuItem key={rt.name} value={rt.name}>
+                          {rt.display_name}
+                        </MenuItem>
+                      ))
+                    )}
+                  </Select>
+                </FormControl>
                 <FormControlLabel
                   control={
                     <Switch
@@ -492,6 +524,9 @@ const WebhookJobs: React.FC = () => {
                 </Typography>
                 <Typography variant="subtitle1" gutterBottom>
                   <strong>Status:</strong> {selectedJob.is_active ? 'Active' : 'Inactive'}
+                </Typography>
+                <Typography variant="subtitle1" gutterBottom>
+                  <strong>Language:</strong> {selectedJob.language || 'python'}
                 </Typography>
                 <Typography variant="subtitle1" gutterBottom>
                   <strong>Timeout:</strong> {selectedJob.timeout} seconds
