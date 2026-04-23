@@ -22,6 +22,19 @@ logger = logging.getLogger(__name__)
 # Label used to identify containers managed by this app
 APP_LABEL = "managed-by=supakiln"
 
+# Default tmpfs size for the worker container's /tmp. Caps how much
+# scratch space user code can consume inside a single container.
+DEFAULT_TMPFS_SIZE = os.environ.get("SUPAKILN_CONTAINER_TMPFS_SIZE", "128m")
+
+
+class WorkerUnreachableError(Exception):
+    """Raised when the worker container's HTTP endpoint is unreachable.
+
+    Distinct from errors in user code (non-zero exit / stderr / timeouts):
+    those are returned as normal results. This is for "the worker process
+    itself isn't there anymore" — we should evict the cache and recreate.
+    """
+
 
 def _worker_host_from_env() -> str:
     """Resolve the hostname the backend uses to reach user-container published ports.
@@ -59,6 +72,12 @@ class CodeExecutor:
         # TCP connection to the worker when possible.
         self._http = requests.Session()
         self._worker_host = _worker_host_from_env()
+        # Concurrency: one lock per cache_key guards cold-start so parallel
+        # first-time requests for the same (language, packages) don't both
+        # build+run, leaving one orphan. The guard-lock protects the dict
+        # of per-key locks; per-key locks protect slow work.
+        self._cache_lock_guard = threading.Lock()
+        self._cache_locks: Dict[str, threading.Lock] = {}
 
         # Network mode configuration (defaults to 'none' for security)
         # Can be set to 'bridge' to allow network access when needed
@@ -372,61 +391,126 @@ USER codeuser
             time.sleep(0.05)
         raise Exception(f"worker at {host}:{port} not healthy after {timeout_s}s ({last_err})")
 
+    def _get_cache_lock(self, cache_key: str) -> threading.Lock:
+        """Return the lock for this cache_key, creating it lazily."""
+        with self._cache_lock_guard:
+            lock = self._cache_locks.get(cache_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._cache_locks[cache_key] = lock
+            return lock
+
+    def _evict_worker(self, cache_key: str, container_id: Optional[str]) -> None:
+        """Forget a worker and force-remove its container (best effort).
+
+        Called when we detect the worker is unreachable or we explicitly
+        want to tear it down. Must be idempotent: the container may
+        already be gone.
+        """
+        self.worker_containers.pop(cache_key, None)
+        # Only pop endpoints if this container_id still owns it; a racing
+        # recreation could have updated it already.
+        if container_id is not None:
+            cur = self.worker_endpoints.get(container_id)
+            if cur is not None:
+                self.worker_endpoints.pop(container_id, None)
+            if self.containers.get(cache_key) == container_id:
+                self.containers.pop(cache_key, None)
+            try:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_id],
+                    capture_output=True, env=os.environ.copy(),
+                    timeout=15,
+                )
+            except Exception as e:
+                logger.debug("best-effort rm failed for %s: %s", container_id, e)
+
     def _get_or_create_worker_container(
         self,
         runtime: Runtime,
         packages: List[str],
         timings: Dict[str, float],
     ) -> Tuple[str, str, int]:
-        """Return (container_id, worker_host, worker_port), creating if needed."""
+        """Return (container_id, worker_host, worker_port), creating if needed.
+
+        Cold-start is serialized per cache_key so parallel first-time
+        requests don't each build+run, leaving one orphan.
+        """
         package_hash = self._get_package_hash(packages)
         cache_key = f"{runtime.name}:{package_hash}"
 
+        # Fast path: cache hit without acquiring the per-key lock.
         if cache_key in self.worker_containers:
             container_id = self.worker_containers[cache_key]
             host, port = self.worker_endpoints[container_id]
             timings['container_cache_hit'] = 1.0
             return container_id, host, port
 
-        timings['container_cache_hit'] = 0.0
-        t_build = perf_counter()
-        image_tag = self._build_runtime_image(runtime, packages)
-        timings['build_image_ms'] = (perf_counter() - t_build) * 1000
+        lock = self._get_cache_lock(cache_key)
+        with lock:
+            # Double-check: another thread may have populated the cache
+            # while we were waiting for the lock.
+            if cache_key in self.worker_containers:
+                container_id = self.worker_containers[cache_key]
+                host, port = self.worker_endpoints[container_id]
+                timings['container_cache_hit'] = 1.0
+                return container_id, host, port
 
-        t_run = perf_counter()
-        success, output, error = self._run_docker_command([
-            "docker", "run",
-            "-d",
-            "--label", APP_LABEL,
-            "--memory", "512m",
-            "--cpus", "0.5",
-            "--network", "bridge",  # worker needs network; dind bridge only
-            "--user", "1000:1000",
-            "--cap-drop", "ALL",
-            "--pids-limit", "100",
-            "-p", str(runtime.worker_port),  # publish to random host port on dind
-            image_tag,
-        ])
-        timings['docker_run_ms'] = (perf_counter() - t_run) * 1000
-        if not success:
-            raise Exception(f"Failed to create worker container: {error}")
-        container_id = output.strip()
+            timings['container_cache_hit'] = 0.0
+            t_build = perf_counter()
+            image_tag = self._build_runtime_image(runtime, packages)
+            timings['build_image_ms'] = (perf_counter() - t_build) * 1000
 
-        t_port = perf_counter()
-        host_port = self._read_worker_port(container_id, runtime.worker_port)
-        timings['read_port_ms'] = (perf_counter() - t_port) * 1000
+            t_run = perf_counter()
+            success, output, error = self._run_docker_command([
+                "docker", "run",
+                "-d",
+                "--label", APP_LABEL,
+                "--memory", "512m",
+                "--cpus", "0.5",
+                "--network", "bridge",  # worker needs network; dind bridge only
+                "--user", "1000:1000",
+                "--cap-drop", "ALL",
+                "--pids-limit", "100",
+                # Tmpfs for /tmp so user code can't indefinitely grow the
+                # container's writable layer. 128m is enough for realistic
+                # scratch work; override with SUPAKILN_CONTAINER_TMPFS_SIZE.
+                "--tmpfs", f"/tmp:size={DEFAULT_TMPFS_SIZE},mode=1777",
+                "-p", str(runtime.worker_port),  # publish to random host port on dind
+                image_tag,
+            ])
+            timings['docker_run_ms'] = (perf_counter() - t_run) * 1000
+            if not success:
+                raise Exception(f"Failed to create worker container: {error}")
+            container_id = output.strip()
 
-        host = self._worker_host
-        t_health = perf_counter()
-        self._wait_for_worker_health(host, host_port)
-        timings['worker_health_ms'] = (perf_counter() - t_health) * 1000
+            try:
+                t_port = perf_counter()
+                host_port = self._read_worker_port(container_id, runtime.worker_port)
+                timings['read_port_ms'] = (perf_counter() - t_port) * 1000
 
-        self.worker_containers[cache_key] = container_id
-        self.worker_endpoints[container_id] = (host, host_port)
-        # Also register in the legacy `containers` dict so existing code
-        # (debug endpoints, container_id lookups) still works.
-        self.containers[cache_key] = container_id
-        return container_id, host, host_port
+                host = self._worker_host
+                t_health = perf_counter()
+                self._wait_for_worker_health(host, host_port)
+                timings['worker_health_ms'] = (perf_counter() - t_health) * 1000
+            except Exception:
+                # If we couldn't bring the worker up, don't leave the
+                # container running as an orphan.
+                try:
+                    subprocess.run(
+                        ["docker", "rm", "-f", container_id],
+                        capture_output=True, env=os.environ.copy(), timeout=15,
+                    )
+                except Exception:
+                    pass
+                raise
+
+            self.worker_containers[cache_key] = container_id
+            self.worker_endpoints[container_id] = (host, host_port)
+            # Also register in the legacy `containers` dict so existing code
+            # (debug endpoints, container_id lookups) still works.
+            self.containers[cache_key] = container_id
+            return container_id, host, host_port
 
     def _exec_via_worker(
         self,
@@ -436,7 +520,13 @@ USER codeuser
         env_vars: Dict[str, str],
         timeout_ms: int,
     ) -> Tuple[bool, Optional[str], Optional[str], bool]:
-        """POST code to the worker; return (success, stdout, stderr, timed_out)."""
+        """POST code to the worker; return (success, stdout, stderr, timed_out).
+
+        Raises WorkerUnreachableError if the worker HTTP endpoint can't be
+        reached at all — the caller should evict cache and retry. Does NOT
+        raise for user-code failures (non-zero exit, stderr, timed_out);
+        those come back as normal return values.
+        """
         url = f"http://{host}:{port}/exec"
         # Worker enforces timeout on its side; we give the HTTP client a
         # small slack buffer so the server can surface a timed_out=True
@@ -448,11 +538,24 @@ USER codeuser
                 json={"code": code, "env": env_vars or {}, "timeout_ms": timeout_ms},
                 timeout=http_timeout,
             )
+        except requests.ConnectionError as e:
+            # Worker is gone (container died, daemon restarted, TCP reset).
+            raise WorkerUnreachableError(f"worker connection failed: {e}") from e
         except requests.Timeout:
+            # User's code or the worker hung. This can be either "user
+            # code took too long" or "worker stuck"; treat the latter as
+            # a user-visible timeout rather than an unreachable marker,
+            # because the container is usually still alive.
             return False, None, "worker HTTP request timed out", True
         except requests.RequestException as e:
             return False, None, f"worker request failed: {e}", False
 
+        if r.status_code >= 500:
+            # Server-side error from the worker; the process may be in a
+            # bad state. Treat as unreachable so the caller recreates.
+            raise WorkerUnreachableError(
+                f"worker returned status {r.status_code}: {r.text[:200]}"
+            )
         if r.status_code != 200:
             return False, None, f"worker returned status {r.status_code}: {r.text}", False
         try:
@@ -1009,26 +1112,58 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                     "timings_ms": timings,
                 }
 
-            try:
-                container_id, host, port = self._get_or_create_worker_container(
-                    runtime, packages, timings,
-                )
-            except Exception as e:
+            package_hash = self._get_package_hash(packages)
+            cache_key = f"{runtime.name}:{package_hash}"
+
+            # We allow one automatic retry if the cached worker turns out
+            # to be dead — that's the self-heal path. A second consecutive
+            # unreachable worker is reported to the caller.
+            last_unreachable: Optional[WorkerUnreachableError] = None
+            container_id: Optional[str] = None
+            for attempt in range(2):
+                try:
+                    container_id, host, port = self._get_or_create_worker_container(
+                        runtime, packages, timings,
+                    )
+                except Exception as e:
+                    timings['total_ms'] = (perf_counter() - t_start) * 1000
+                    return {
+                        "success": False,
+                        "output": None,
+                        "error": f"Failed to prepare worker container: {e}",
+                        "timings_ms": timings,
+                    }
+
+                t_exec = perf_counter()
+                try:
+                    success, stdout, stderr, timed_out = self._exec_via_worker(
+                        host, port, code, env_vars, timeout_ms=int(timeout * 1000),
+                    )
+                    timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
+                    if attempt == 1:
+                        timings['self_heal_recovered'] = 1.0
+                    break
+                except WorkerUnreachableError as e:
+                    last_unreachable = e
+                    timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
+                    timings[f'self_heal_attempt_{attempt}'] = 1.0
+                    # Evict the dead worker. Next iteration rebuilds.
+                    self._evict_worker(cache_key, container_id)
+                    container_id = None
+            else:
+                # Both attempts failed — worker couldn't be reached even
+                # after recreating. Surface a clear error.
                 timings['total_ms'] = (perf_counter() - t_start) * 1000
                 return {
                     "success": False,
                     "output": None,
-                    "error": f"Failed to prepare worker container: {e}",
+                    "error": f"Worker unreachable after retry: {last_unreachable}",
+                    "container_id": None,
+                    "timed_out": False,
                     "timings_ms": timings,
                 }
 
-            t_exec = perf_counter()
-            success, stdout, stderr, timed_out = self._exec_via_worker(
-                host, port, code, env_vars, timeout_ms=int(timeout * 1000),
-            )
-            timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
             timings['total_ms'] = (perf_counter() - t_start) * 1000
-
             output = stdout if stdout else None
             # Preserve existing contract: stderr is returned as `error` iff
             # the process actually failed (non-zero exit or timeout); a
