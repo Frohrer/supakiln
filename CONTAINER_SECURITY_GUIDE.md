@@ -2,6 +2,82 @@
 
 This guide provides comprehensive information about container security testing and hardening for the code execution environment.
 
+## Supakiln Hardening Posture
+
+This section documents what the codebase **actually wires** when it creates user-code containers, plus the host-level knobs that aren't under the app's control.
+
+### Always on (no configuration needed)
+
+Every container holding untrusted code runs with the following flags, centralised in `CodeExecutor._hardening_run_flags()`:
+
+- `--user 1000:1000` — non-root inside the container
+- `--cap-drop ALL` — no Linux capabilities retained
+- `--read-only` — root filesystem is read-only
+- `--security-opt no-new-privileges` — blocks setuid escalation
+- `--memory=<limit>` and `--memory-swap=<same>` — swap evasion of `memory.max` is blocked
+- `--cpus=<limit>` — CPU quota
+- `--pids-limit=<N>` — pid cgroup cap
+- `--ulimit nofile=N:N` and `--ulimit nproc=N:N` — belt-and-suspenders ulimits next to the cgroup caps
+- `--security-opt seccomp=/etc/supakiln/seccomp.json` — explicit allow-list profile, shipped in `security/seccomp.json`. Note: the path is resolved by the Docker *client* (the backend), not the daemon, so the profile is bind-mounted into the backend container at `/etc/supakiln/`. It's also mounted into the `docker-daemon` container at the same path for symmetry / future tooling.
+- `/tmp` and `/home/codeuser` as size-capped tmpfs — user code cannot grow the writable layer indefinitely
+- `/tmp` is `noexec` on the worker path; `/home/codeuser` is `exec` only because `go run` exec()s its own output
+
+Tune via env vars in `docker-compose.yml`:
+`SUPAKILN_MEMORY_LIMIT`, `SUPAKILN_MEMORY_SWAP`, `SUPAKILN_CPU_LIMIT`, `SUPAKILN_PIDS_LIMIT`, `SUPAKILN_NOFILE_LIMIT`, `SUPAKILN_NPROC_LIMIT`, `SUPAKILN_SECCOMP_PROFILE_PATH`.
+
+### Opt-in (requires operator action)
+
+**AppArmor profile**
+Set `SUPAKILN_APPARMOR_PROFILE=<name>` to pin a loaded profile. Without this, Docker's default (`docker-default`) is used if AppArmor is installed on the host, otherwise containers are `unconfined`. See the AppArmor Profile section below for a starting template; load it on the host via `apparmor_parser -r` before setting the env var.
+
+**User-namespace remapping**
+Edit `./security/daemon.json` (mounted read-only into the dind container at `/etc/docker/daemon.json`) and set `"userns-remap": "default"`. See `./security/daemon.json.example` for a template. After editing, `docker compose restart docker-daemon`. This maps container UID 1000 to a subordinate host UID, so a kernel-bug sandbox escape lands the attacker as a non-real host user rather than host UID 1000. First-enable rebuilds all cached user images and resets all tmpfs contents — plan a maintenance window.
+
+> **Note on `command:` in compose:** do not wrap `dockerd` in `sh -c` — the docker:dind image's entrypoint only does its critical setup (tini as pid 1, iptables modprobe, cgroup v2 prep) when arg 1 is literally `dockerd`. Wrap in a shell and cgroup controllers silently fail to propagate; any `--memory`/`--cpus` container fails to start with a cryptic "domain controllers -- it is in an invalid state" error.
+
+### Host prerequisites (not set by this repo)
+
+These live on the Docker host and can't be configured from inside the dind container. Set them in `/etc/sysctl.d/` and reboot:
+
+```
+# Disable unprivileged user namespaces — defense-in-depth even if a
+# seccomp bypass lets `unshare` through.
+kernel.unprivileged_userns_clone=0
+
+# Disable unprivileged BPF — eliminates a historically fertile source
+# of container-escape CVEs.
+kernel.unprivileged_bpf_disabled=1
+
+# Restrict ptrace to same-UID processes only (2) or disable entirely (3).
+kernel.yama.ptrace_scope=2
+```
+
+### Exhausted-container eviction ("cooked" workers)
+
+A pid bomb or memory bomb can leave a container in a half-alive state: the worker process is still listening, but every subsequent `Popen` fails with EAGAIN/ENOMEM. Supakiln detects this in two ways:
+
+1. **Reactive (hot path):** the worker catches `OSError(EAGAIN|ENOMEM|ENOSPC)` around `Popen` and responds to `/exec` with HTTP 503 and `{"cooked": true}`. The backend's existing self-heal retry path evicts the container and rebuilds on the retry attempt.
+
+2. **Proactive (background reaper):** `scheduler._schedule_cooked_reaper()` runs every `SUPAKILN_COOKED_REAPER_INTERVAL_SECONDS` (30s default). It probes `/health` on every idle worker; the worker returns cgroup pressure stats (`pids.current/max`, `memory.current/max`). Workers reporting ≥ `SUPAKILN_COOKED_THRESHOLD_PCT` (90 % default) or unreachable are evicted.
+
+The reaper skips workers with `busy_count > 0` — evicting mid-call tears the connection out from under the caller. Busy cooked workers catch up on the next sweep once their `/exec` returns (or 503s, which the hot path already handles).
+
+### Single-use vs. reuse invariant
+
+Worker containers are **cached per `(user_id, language, package_hash)`**. The cache key includes `user_id`, so one user's container is never reused for another user — the tenant boundary is the container. Within one user's (language, packages) bucket, a container is reused across `/exec` calls until the idle TTL fires or the cooked reaper evicts it. This is an intentional tradeoff: one-container-per-execution would push the cold-start cost (build + run + health-wait, typically 1-3s) onto every call.
+
+Known gap — concurrent `/exec` on a reused worker: `workers/worker.py` uses `ThreadingHTTPServer`, and its `_reap_leftover_state` broadcasts SIGKILL to every UID-1000 process at the end of a call. If one user has two concurrent `/exec` calls on the same worker, one call's cleanup will kill the other's subprocess. A per-worker mutex would fix this. It's a correctness issue (one call aborts early), not a cross-tenant security issue.
+
+### Network posture
+
+User-code containers connect to the dind bridge network (`--network=bridge`) because the worker needs to accept HTTP from the backend. User code running in that same container therefore shares the bridge. Egress filtering (block `169.254.169.254/32`, RFC1918, everything but explicitly allowed registries) must be done at the bridge level — not in this repo. Confirm with the network team before treating workloads as hostile-capable.
+
+### Base-image minimisation
+
+Runtime Dockerfiles intentionally keep the toolchain (Go compiler, Node, Ruby, Python stdlib) present because user code needs it. There is no standalone `ip`/`iproute2` installed on the worker path; `bash.Dockerfile` adds `curl`, `jq`, and `ca-certificates` because bash workflows actually use them. Audit `ls /usr/bin /bin` inside a running worker if you want to shrink further — each tool is an exploitation gadget.
+
+
+
 ## Security Test Suite
 
 The security test suite includes comprehensive tests for container breakout vulnerabilities and security misconfigurations.
