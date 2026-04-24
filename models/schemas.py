@@ -193,4 +193,79 @@ class PersistentServiceResponse(BaseModel):
     restart_policy: str
     description: Optional[str]
     process_id: Optional[str]
-    auto_start: bool 
+    auto_start: bool
+
+
+# ---------------------------------------------------------------------
+# Auth / users / API keys
+# ---------------------------------------------------------------------
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    """Issued on successful login. `session_token` is also set as an
+    HttpOnly cookie; callers that prefer Authorization headers can use
+    the token directly."""
+
+    session_token: str
+    user: "UserResponse"
+
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    is_admin: bool
+    disabled: bool
+    created_at: str
+
+
+class UserCreateRequest(BaseModel):
+    """Admin-only endpoint body for creating new users."""
+
+    email: str
+    password: str
+    is_admin: Optional[bool] = False
+
+
+class UserUpdateRequest(BaseModel):
+    """Admin-only endpoint body for updating a user.
+
+    All fields optional; pass only the ones you want to change. Setting
+    `password` to non-empty resets the user's password.
+    """
+
+    email: Optional[str] = None
+    password: Optional[str] = None
+    is_admin: Optional[bool] = None
+    disabled: Optional[bool] = None
+
+
+class ApiKeyCreateRequest(BaseModel):
+    label: Optional[str] = None
+
+
+class ApiKeyCreateResponse(BaseModel):
+    """Plaintext token is returned exactly once. Store it somewhere
+    durable immediately; the server only retains its hash."""
+
+    id: int
+    token: str
+    prefix: str
+    label: Optional[str]
+    created_at: str
+
+
+class ApiKeyResponse(BaseModel):
+    id: int
+    prefix: str
+    label: Optional[str]
+    last_used_at: Optional[str]
+    created_at: str
+
+
+LoginResponse.model_rebuild()
+ 

@@ -3,6 +3,7 @@ import os
 import json
 import time
 import hashlib
+import secrets
 import threading
 import base64
 import docker
@@ -34,6 +35,18 @@ class WorkerUnreachableError(Exception):
     those are returned as normal results. This is for "the worker process
     itself isn't there anymore" — we should evict the cache and recreate.
     """
+
+
+class WorkerCapError(Exception):
+    """Raised when worker count caps prevent creating a new container.
+
+    Carries an `http_status` (429 for per-user cap, 503 for global) so the
+    API layer can map to the right response code.
+    """
+
+    def __init__(self, message: str, http_status: int):
+        super().__init__(message)
+        self.http_status = http_status
 
 
 def _worker_host_from_env() -> str:
@@ -82,6 +95,14 @@ class CodeExecutor:
         # of per-key locks; per-key locks protect slow work.
         self._cache_lock_guard = threading.Lock()
         self._cache_locks: Dict[str, threading.Lock] = {}
+
+        # In-flight /exec calls per container. The evictor (cap-enforcer
+        # and pressure reaper) will never pick a container with
+        # busy_count > 0. Incremented before returning from
+        # `_get_or_create_worker_container`; decremented in the caller's
+        # `finally`. Protected by _busy_lock.
+        self._busy_counts: Dict[str, int] = {}
+        self._busy_lock = threading.Lock()
 
         # Network mode configuration (defaults to 'none' for security)
         # Can be set to 'bridge' to allow network access when needed
@@ -434,25 +455,270 @@ USER codeuser
             except Exception as e:
                 logger.debug("best-effort rm failed for %s: %s", container_id, e)
 
+    # ------------------------------------------------------------------
+    # Busy-count tracking.
+    #
+    # We must NOT evict a worker that is mid-call — that would racily tear
+    # the container out from under an in-flight request. `_mark_busy` is
+    # called right before returning from `_get_or_create_worker_container`
+    # so there is no gap between "I'm using this worker" and "it's marked
+    # busy". The caller (`execute_code`) drops it in a `finally`.
+    # ------------------------------------------------------------------
+
+    def _mark_busy(self, container_id: str) -> None:
+        with self._busy_lock:
+            self._busy_counts[container_id] = (
+                self._busy_counts.get(container_id, 0) + 1
+            )
+
+    def _mark_idle(self, container_id: str) -> None:
+        with self._busy_lock:
+            cur = self._busy_counts.get(container_id, 0)
+            if cur <= 1:
+                self._busy_counts.pop(container_id, None)
+            else:
+                self._busy_counts[container_id] = cur - 1
+
+    def _is_busy(self, container_id: str) -> bool:
+        with self._busy_lock:
+            return self._busy_counts.get(container_id, 0) > 0
+
+    # ------------------------------------------------------------------
+    # Cap enforcement + pressure eviction.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_caps() -> Tuple[int, int]:
+        """Read (max_global, max_per_user) from env on every call.
+
+        Defaults are intentionally modest — a single-host dind has a
+        hard memory ceiling, and each worker holds ~50MB idle + up to
+        the 512MB --memory limit. 50 workers × ~100MB working-set is
+        already ~5GB. 5/user prevents one tenant from monopolising.
+        """
+        try:
+            mx = int(os.environ.get("SUPAKILN_MAX_WORKERS", "50"))
+        except ValueError:
+            mx = 50
+        try:
+            mxu = int(os.environ.get("SUPAKILN_MAX_WORKERS_PER_USER", "5"))
+        except ValueError:
+            mxu = 5
+        return mx, mxu
+
+    def _user_workers(self, user_id: int) -> List[Tuple[str, Dict]]:
+        return [
+            (cid, meta)
+            for cid, meta in self.worker_meta.items()
+            if meta.get("user_id") == user_id
+        ]
+
+    def _evict_for_caps(self, user_id: int) -> None:
+        """Make room before creating a new worker for `user_id`.
+
+        Per-user cap fires first (most common quota trigger); global cap
+        catches the aggregate. In both cases we pick the LRU idle worker
+        to evict. If all candidates are busy, raise WorkerCapError so
+        the API can return 429/503 and the client can retry.
+
+        Must be called with the caller's cache_lock already held — this
+        keeps eviction and new-container-creation atomic for the same
+        cache_key.
+        """
+        max_global, max_per_user = self._get_caps()
+
+        # Per-user cap. Evict the caller's own LRU idle worker first; if
+        # none of theirs are idle, refuse.
+        user_workers = self._user_workers(user_id)
+        if len(user_workers) >= max_per_user:
+            idle = [(cid, m) for cid, m in user_workers if not self._is_busy(cid)]
+            if not idle:
+                raise WorkerCapError(
+                    f"per-user worker cap reached "
+                    f"({max_per_user}) and all are busy",
+                    http_status=429,
+                )
+            idle.sort(key=lambda pair: pair[1]["last_used"])
+            victim_cid, victim_meta = idle[0]
+            logger.info(
+                "Cap-evicting user %s's LRU worker %s (cache_key=%s)",
+                user_id, victim_cid[:12], victim_meta["cache_key"],
+            )
+            self._evict_worker(victim_meta["cache_key"], victim_cid)
+
+        # Global cap. Evict the globally-LRU idle worker, which may or
+        # may not belong to this user.
+        if len(self.worker_meta) >= max_global:
+            idle = [
+                (cid, m) for cid, m in self.worker_meta.items()
+                if not self._is_busy(cid)
+            ]
+            if not idle:
+                raise WorkerCapError(
+                    f"global worker cap reached "
+                    f"({max_global}) and all are busy",
+                    http_status=503,
+                )
+            idle.sort(key=lambda pair: pair[1]["last_used"])
+            victim_cid, victim_meta = idle[0]
+            logger.info(
+                "Cap-evicting global LRU worker %s (user=%s, cache_key=%s)",
+                victim_cid[:12],
+                victim_meta.get("user_id"),
+                victim_meta["cache_key"],
+            )
+            self._evict_worker(victim_meta["cache_key"], victim_cid)
+
+    # ------------------------------------------------------------------
+    # Pressure reapers (called by the scheduler's background thread).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_host_memory_pct() -> Optional[float]:
+        """Return used-memory fraction (0..1) from /proc/meminfo.
+
+        Uses MemAvailable when present (it's the kernel's own estimate
+        of "memory that can be allocated without swapping"), which is
+        the right signal for eviction decisions. Falls back to
+        Total-Free-Cached-Buffers on older kernels.
+        """
+        try:
+            with open("/proc/meminfo", "r") as f:
+                fields = {}
+                for line in f:
+                    k, _, rest = line.partition(":")
+                    v = rest.strip().split()
+                    if v:
+                        try:
+                            fields[k] = int(v[0])
+                        except ValueError:
+                            pass
+        except OSError:
+            return None
+        total = fields.get("MemTotal")
+        if not total:
+            return None
+        avail = fields.get("MemAvailable")
+        if avail is None:
+            free = fields.get("MemFree", 0)
+            cached = fields.get("Cached", 0)
+            buffers = fields.get("Buffers", 0)
+            avail = free + cached + buffers
+        used = total - avail
+        return max(0.0, min(1.0, used / total))
+
+    @staticmethod
+    def _read_host_loadavg_1m() -> Optional[float]:
+        try:
+            with open("/proc/loadavg", "r") as f:
+                parts = f.read().split()
+            if parts:
+                return float(parts[0])
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _idle_lru(self) -> List[Tuple[str, Dict]]:
+        """Return non-busy workers sorted oldest-used-first."""
+        idle = [
+            (cid, m) for cid, m in self.worker_meta.items()
+            if not self._is_busy(cid)
+        ]
+        idle.sort(key=lambda pair: pair[1]["last_used"])
+        return idle
+
+    def reap_memory_pressure(self) -> List[str]:
+        """Evict LRU idle workers while host memory is above high water.
+
+        Two thresholds avoid thrash:
+          SUPAKILN_MEMORY_HIGH_WATER_PCT  start reaping when used > this
+          SUPAKILN_MEMORY_LOW_WATER_PCT   stop when used drops below
+        Returns the list of container_ids reaped (empty if nothing to do).
+        """
+        try:
+            high = float(os.environ.get("SUPAKILN_MEMORY_HIGH_WATER_PCT", "85")) / 100.0
+        except ValueError:
+            high = 0.85
+        try:
+            low = float(os.environ.get("SUPAKILN_MEMORY_LOW_WATER_PCT", "70")) / 100.0
+        except ValueError:
+            low = 0.70
+        if low >= high:
+            low = max(0.0, high - 0.10)
+
+        used = self._read_host_memory_pct()
+        if used is None or used < high:
+            return []
+
+        reaped: List[str] = []
+        for cid, meta in self._idle_lru():
+            self._evict_worker(meta["cache_key"], cid)
+            reaped.append(cid)
+            # Re-check after each eviction; the kernel is slow to
+            # reclaim tmpfs pages, so we don't always see a drop
+            # immediately. Cap the batch at len(idle) workers.
+            used = self._read_host_memory_pct()
+            if used is not None and used <= low:
+                break
+        return reaped
+
+    def reap_cpu_pressure(self) -> List[str]:
+        """Evict LRU idle workers while 1-min load exceeds SUPAKILN_CPU_HIGH_WATER.
+
+        Default high water is `nproc * 1.5`, i.e. "hosts is noticeably
+        overloaded but not dead". Unlike memory this is often transient;
+        the reaper runs often enough that a single spike is tolerable.
+        """
+        default_high = float(os.cpu_count() or 1) * 1.5
+        try:
+            high = float(
+                os.environ.get("SUPAKILN_CPU_HIGH_WATER", str(default_high))
+            )
+        except ValueError:
+            high = default_high
+
+        load = self._read_host_loadavg_1m()
+        if load is None or load < high:
+            return []
+
+        reaped: List[str] = []
+        # Evict at most 25% of idle workers per tick to avoid cliffs.
+        idle = self._idle_lru()
+        budget = max(1, len(idle) // 4)
+        for cid, meta in idle[:budget]:
+            self._evict_worker(meta["cache_key"], cid)
+            reaped.append(cid)
+        return reaped
+
     def _get_or_create_worker_container(
         self,
         runtime: Runtime,
         packages: List[str],
         timings: Dict[str, float],
+        user_id: int,
     ) -> Tuple[str, str, int]:
         """Return (container_id, worker_host, worker_port), creating if needed.
 
         Cold-start is serialized per cache_key so parallel first-time
         requests don't each build+run, leaving one orphan.
+
+        `user_id` is part of the cache key: every tenant gets their own
+        worker container for a given (language, packages). This is the
+        primary multi-tenant isolation boundary — one user's filesystem,
+        process, and network state never touch another's.
         """
         package_hash = self._get_package_hash(packages)
-        cache_key = f"{runtime.name}:{package_hash}"
+        cache_key = f"{runtime.name}:u{user_id}:{package_hash}"
 
         # Fast path: cache hit without acquiring the per-key lock.
         if cache_key in self.worker_containers:
             container_id = self.worker_containers[cache_key]
             host, port = self.worker_endpoints[container_id]
             timings['container_cache_hit'] = 1.0
+            # Mark busy BEFORE returning so a concurrent evictor doesn't
+            # pick this container in the window between return and the
+            # caller's subsequent _exec_via_worker call.
+            self._mark_busy(container_id)
             return container_id, host, port
 
         lock = self._get_cache_lock(cache_key)
@@ -463,12 +729,25 @@ USER codeuser
                 container_id = self.worker_containers[cache_key]
                 host, port = self.worker_endpoints[container_id]
                 timings['container_cache_hit'] = 1.0
+                self._mark_busy(container_id)
                 return container_id, host, port
 
             timings['container_cache_hit'] = 0.0
+
+            # About to create a new worker — make room first. This may
+            # raise WorkerCapError(429/503), which bubbles up cleanly.
+            self._evict_for_caps(user_id)
+
             t_build = perf_counter()
             image_tag = self._build_runtime_image(runtime, packages)
             timings['build_image_ms'] = (perf_counter() - t_build) * 1000
+
+            # Mint a one-time shared secret and pass it as an env var.
+            # The worker enforces it on /exec; sibling containers on the
+            # same dind bridge no longer have an unauthenticated escape
+            # hatch to each other. secrets.token_urlsafe returns ~43
+            # chars of entropy from 32 bytes.
+            worker_token = secrets.token_urlsafe(32)
 
             t_run = perf_counter()
             success, output, error = self._run_docker_command([
@@ -481,10 +760,22 @@ USER codeuser
                 "--user", "1000:1000",
                 "--cap-drop", "ALL",
                 "--pids-limit", "100",
+                # Block setuid escalation via /usr/bin/su, passwd, etc.
+                "--security-opt", "no-new-privileges",
+                # Rootfs read-only; writable areas are explicit tmpfs
+                # mounts. A future Dockerfile regression that chowns a
+                # system dir to codeuser no longer becomes a persistence
+                # vector.
+                "--read-only",
                 # Tmpfs for /tmp so user code can't indefinitely grow the
                 # container's writable layer. 128m is enough for realistic
                 # scratch work; override with SUPAKILN_CONTAINER_TMPFS_SIZE.
                 "--tmpfs", f"/tmp:size={DEFAULT_TMPFS_SIZE},mode=1777",
+                # Writable home, also tmpfs so it resets with the
+                # container. Keeps install-free languages (bash, go)
+                # working when they want a writable $HOME.
+                "--tmpfs", "/home/codeuser:size=16m,mode=0755,uid=1000,gid=1000",
+                "-e", f"SUPAKILN_WORKER_TOKEN={worker_token}",
                 "-p", str(runtime.worker_port),  # publish to random host port on dind
                 image_tag,
             ])
@@ -521,12 +812,17 @@ USER codeuser
                 "language": runtime.name,
                 "package_hash": package_hash,
                 "cache_key": cache_key,
+                "user_id": user_id,
                 "created_at": now,
                 "last_used": now,
+                "worker_token": worker_token,
             }
             # Also register in the legacy `containers` dict so existing code
             # (debug endpoints, container_id lookups) still works.
             self.containers[cache_key] = container_id
+            # Mark busy before returning — same rationale as the cache-
+            # hit path. The caller's `finally` pairs it with _mark_idle.
+            self._mark_busy(container_id)
             return container_id, host, host_port
 
     def _exec_via_worker(
@@ -536,6 +832,7 @@ USER codeuser
         code: str,
         env_vars: Dict[str, str],
         timeout_ms: int,
+        token: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[str], bool]:
         """POST code to the worker; return (success, stdout, stderr, timed_out).
 
@@ -549,10 +846,14 @@ USER codeuser
         # small slack buffer so the server can surface a timed_out=True
         # response rather than us hanging up.
         http_timeout = max(1.0, timeout_ms / 1000.0 + 5.0)
+        headers = {}
+        if token:
+            headers["X-Supakiln-Token"] = token
         try:
             r = self._http.post(
                 url,
                 json={"code": code, "env": env_vars or {}, "timeout_ms": timeout_ms},
+                headers=headers,
                 timeout=http_timeout,
             )
         except requests.ConnectionError as e:
@@ -778,6 +1079,7 @@ USER codeuser
         timeout: int = 30,
         env_vars: Dict[str, str] = None,
         language: str = "python",
+        user_id: int = 1,
     ) -> Dict:
         """
         Execute code in a container with the specified packages.
@@ -789,6 +1091,12 @@ USER codeuser
             env_vars: Dictionary of environment variables to pass to the container
             language: Runtime to use (default "python"). Must be registered
                       in the `languages` module.
+            user_id: Owner of this execution. Used as part of the worker
+                     cache key, so each user runs in their own container
+                     for a given (language, packages). Defaults to the
+                     system user (id=1) — callers that haven't been
+                     wired through the auth layer yet will all share it,
+                     which matches the pre-auth behaviour.
 
         Returns:
             Dict containing execution results
@@ -1130,18 +1438,35 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                 }
 
             package_hash = self._get_package_hash(packages)
-            cache_key = f"{runtime.name}:{package_hash}"
+            cache_key = f"{runtime.name}:u{user_id}:{package_hash}"
 
             # We allow one automatic retry if the cached worker turns out
             # to be dead — that's the self-heal path. A second consecutive
             # unreachable worker is reported to the caller.
+            #
+            # Lease/busy protocol: `_get_or_create_worker_container`
+            # marks the returned container busy on our behalf. We must
+            # pair that with exactly one `_mark_idle` per attempt,
+            # regardless of which branch we exit through (success,
+            # user-code failure, timeout, or self-heal reconstruction).
             last_unreachable: Optional[WorkerUnreachableError] = None
             container_id: Optional[str] = None
             for attempt in range(2):
                 try:
                     container_id, host, port = self._get_or_create_worker_container(
-                        runtime, packages, timings,
+                        runtime, packages, timings, user_id,
                     )
+                except WorkerCapError as e:
+                    # Cap-induced failure: surface the HTTP status so
+                    # the router can return 429 / 503 instead of 500.
+                    timings['total_ms'] = (perf_counter() - t_start) * 1000
+                    return {
+                        "success": False,
+                        "output": None,
+                        "error": str(e),
+                        "http_status": e.http_status,
+                        "timings_ms": timings,
+                    }
                 except Exception as e:
                     timings['total_ms'] = (perf_counter() - t_start) * 1000
                     return {
@@ -1151,26 +1476,36 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                         "timings_ms": timings,
                     }
 
+                # We now hold a busy lease on `container_id`. Use a
+                # try/finally to guarantee release along every path.
                 t_exec = perf_counter()
+                lease_cid = container_id
                 try:
-                    success, stdout, stderr, timed_out = self._exec_via_worker(
-                        host, port, code, env_vars, timeout_ms=int(timeout * 1000),
-                    )
-                    timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
-                    if attempt == 1:
-                        timings['self_heal_recovered'] = 1.0
-                    # Record liveness for lifecycle + idle reaper.
-                    meta = self.worker_meta.get(container_id)
-                    if meta is not None:
-                        meta["last_used"] = time.time()
-                    break
-                except WorkerUnreachableError as e:
-                    last_unreachable = e
-                    timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
-                    timings[f'self_heal_attempt_{attempt}'] = 1.0
-                    # Evict the dead worker. Next iteration rebuilds.
-                    self._evict_worker(cache_key, container_id)
-                    container_id = None
+                    meta_for_token = self.worker_meta.get(container_id, {})
+                    try:
+                        success, stdout, stderr, timed_out = self._exec_via_worker(
+                            host, port, code, env_vars,
+                            timeout_ms=int(timeout * 1000),
+                            token=meta_for_token.get("worker_token"),
+                        )
+                        timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
+                        if attempt == 1:
+                            timings['self_heal_recovered'] = 1.0
+                        # Record liveness for lifecycle + idle reaper.
+                        meta = self.worker_meta.get(container_id)
+                        if meta is not None:
+                            meta["last_used"] = time.time()
+                        break
+                    except WorkerUnreachableError as e:
+                        last_unreachable = e
+                        timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
+                        timings[f'self_heal_attempt_{attempt}'] = 1.0
+                        # Evict the dead worker. Next iteration rebuilds.
+                        self._evict_worker(cache_key, container_id)
+                        container_id = None
+                        # Loop continues to the next attempt.
+                finally:
+                    self._mark_idle(lease_cid)
             else:
                 # Both attempts failed — worker couldn't be reached even
                 # after recreating. Surface a clear error.
@@ -1222,16 +1557,23 @@ export PYTHONPATH=/tmp:$PYTHONPATH
     # Lifecycle API used by the /workers router and the idle reaper.
     # ------------------------------------------------------------------
 
-    def list_workers(self) -> List[Dict]:
-        """Return a snapshot of live ad-hoc workers."""
+    def list_workers(self, user_id: Optional[int] = None) -> List[Dict]:
+        """Return a snapshot of live ad-hoc workers.
+
+        If `user_id` is provided, only that user's workers are returned.
+        Admins should pass None to see every container.
+        """
         out: List[Dict] = []
         for container_id, meta in list(self.worker_meta.items()):
+            if user_id is not None and meta.get("user_id") != user_id:
+                continue
             endpoint = self.worker_endpoints.get(container_id)
             out.append({
                 "container_id": container_id,
                 "language": meta["language"],
                 "package_hash": meta["package_hash"],
                 "cache_key": meta["cache_key"],
+                "user_id": meta.get("user_id"),
                 "created_at": meta["created_at"],
                 "last_used": meta["last_used"],
                 "host": endpoint[0] if endpoint else None,

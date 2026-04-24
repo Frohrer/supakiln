@@ -63,6 +63,30 @@ services:
       - SUPAKILN_WORKER_IDLE_TTL_SECONDS=${SUPAKILN_WORKER_IDLE_TTL_SECONDS:-1800}
       - SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS=${SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS:-60}
       - SUPAKILN_CONTAINER_TMPFS_SIZE=${SUPAKILN_CONTAINER_TMPFS_SIZE:-128m}
+      # Caps. MAX_WORKERS is the global ceiling; MAX_WORKERS_PER_USER
+      # keeps one tenant from monopolising. Exceeding a cap triggers
+      # synchronous LRU eviction of an idle worker; if none are idle,
+      # /execute returns 429 (per-user) or 503 (global).
+      - SUPAKILN_MAX_WORKERS=${SUPAKILN_MAX_WORKERS:-50}
+      - SUPAKILN_MAX_WORKERS_PER_USER=${SUPAKILN_MAX_WORKERS_PER_USER:-5}
+      # Background pressure reaper. Reads host /proc/meminfo + loadavg
+      # and evicts LRU idle workers when either is above its high water.
+      # Set interval to 0 to disable.
+      - SUPAKILN_PRESSURE_REAPER_INTERVAL_SECONDS=${SUPAKILN_PRESSURE_REAPER_INTERVAL_SECONDS:-30}
+      - SUPAKILN_MEMORY_HIGH_WATER_PCT=${SUPAKILN_MEMORY_HIGH_WATER_PCT:-85}
+      - SUPAKILN_MEMORY_LOW_WATER_PCT=${SUPAKILN_MEMORY_LOW_WATER_PCT:-70}
+      # CPU high water is a 1-minute load average. Default = nproc * 1.5
+      # in code if this is unset.
+      - SUPAKILN_CPU_HIGH_WATER=${SUPAKILN_CPU_HIGH_WATER:-}
+      # Auth — first admin is created from these on startup if no
+      # admin exists yet. Leaving both unset skips bootstrap.
+      - SUPAKILN_BOOTSTRAP_ADMIN_EMAIL=${SUPAKILN_BOOTSTRAP_ADMIN_EMAIL:-}
+      - SUPAKILN_BOOTSTRAP_ADMIN_PASSWORD=${SUPAKILN_BOOTSTRAP_ADMIN_PASSWORD:-}
+      # While true (default during transition), unauthenticated requests
+      # are attributed to the system user instead of being rejected.
+      # Flip to false once all clients send bearer tokens or session
+      # cookies.
+      - SUPAKILN_ALLOW_ANONYMOUS=${SUPAKILN_ALLOW_ANONYMOUS:-true}
     depends_on:
       docker-daemon:
         condition: service_healthy 

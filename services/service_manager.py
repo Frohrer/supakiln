@@ -136,8 +136,10 @@ class ServiceManager:
                 container_id = executor.containers[package_hash]
                 service.container_id = container_id
             
-            # Get environment variables
-            from models import SessionLocal
+            # Get environment variables scoped to the service's owner
+            # (legacy rows without an owner fall back to the system user).
+            from models import SessionLocal, SYSTEM_USER_ID
+            owner_user_id = service.owner_user_id or SYSTEM_USER_ID
             env_db = SessionLocal()
             try:
                 # Try to load existing key
@@ -147,7 +149,7 @@ class ServiceManager:
                 else:
                     key = None
                 env_manager = EnvironmentManager(env_db, key)
-                env_vars = env_manager.get_all_variables()
+                env_vars = env_manager.get_all_variables(owner_user_id=owner_user_id)
             finally:
                 env_db.close()
             

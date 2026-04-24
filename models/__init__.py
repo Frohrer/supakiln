@@ -4,22 +4,28 @@ from db_models import (
     EnvironmentVariable,
     ScheduledJob,
     WebhookJob,
-    PersistentService, 
+    PersistentService,
     ExecutionLog,
     ExposedPort,
+    User,
+    ApiKey,
+    SYSTEM_USER_ID,
     SessionLocal,
     Base,
-    get_db
+    get_db,
 )
 
 __all__ = [
     "EnvironmentVariable",
-    "ScheduledJob", 
+    "ScheduledJob",
     "WebhookJob",
     "PersistentService",
-    "ExecutionLog", 
+    "ExecutionLog",
     "ExposedPort",
+    "User",
+    "ApiKey",
+    "SYSTEM_USER_ID",
     "SessionLocal",
     "Base",
-    "get_db"
-] 
+    "get_db",
+]

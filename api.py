@@ -7,7 +7,20 @@ import uvicorn
 import os
 
 # Import all routers
-from routers import containers, execution, jobs, webhooks, services, environment, logs, webhook_execution, proxy, workers
+from routers import (
+    auth as auth_router,
+    containers,
+    environment,
+    execution,
+    jobs,
+    logs,
+    proxy,
+    services,
+    users as users_router,
+    webhook_execution,
+    webhooks,
+    workers,
+)
 
 # Import services and models for startup
 from services.service_manager import service_manager
@@ -78,6 +91,12 @@ and injected into the user subprocess at execution time.
 """
 
 TAG_METADATA = [
+    {"name": "auth",
+     "description": "Log in, log out, introspect the current session."},
+    {"name": "users",
+     "description": "CRUD for users and API keys. Non-admins can manage "
+                    "their own keys via `/users/me/keys`; admins can "
+                    "manage every user via `/admin/users`."},
     {"name": "execution",
      "description": "Run code on demand and introspect the available runtimes."},
     {"name": "scheduled-jobs",
@@ -127,13 +146,43 @@ app = FastAPI(
     contact={"name": "supakiln", "url": "https://github.com/Frohrer/supakiln"},
 )
 
-# Add CORS middleware with permissive settings since Cloudflare bypasses OPTIONS to origin
+# CORS.
+#
+# With `allow_credentials=True`, browsers require Access-Control-Allow-
+# Origin to echo a specific origin — the `*` shortcut is rejected. So
+# we compute a concrete list: the env-provided ALLOWED_ORIGINS plus
+# localhost dev defaults. The `allow_origin_regex` fallback handles
+# ephemeral origins (Cloudflare preview URLs, etc.) when ENVIRONMENT
+# is not `production`.
+_allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "").strip()
+_allowed_origins = (
+    [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+    if _allowed_origins_env
+    else []
+)
+# Always allow the common dev origins so docker-compose works out of the box.
+for dev_origin in (
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+):
+    if dev_origin not in _allowed_origins:
+        _allowed_origins.append(dev_origin)
+
+_allow_origin_regex = None
+if os.environ.get("ENVIRONMENT", "").lower() != "production":
+    # In dev, accept any localhost / 127.* port so ad-hoc vite servers
+    # or preview builds also work.
+    _allow_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins since Cloudflare handles the actual filtering
+    allow_origins=_allowed_origins,
+    allow_origin_regex=_allow_origin_regex,
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
     max_age=86400,  # Cache preflight requests for 24 hours
 )
 
@@ -157,6 +206,8 @@ async def read_root():
     return FileResponse("static/index.html")
 
 # Include all routers
+app.include_router(auth_router.router)
+app.include_router(users_router.router)
 app.include_router(containers.router)
 app.include_router(execution.router)
 app.include_router(jobs.router)
@@ -201,6 +252,15 @@ async def startup_event():
     if not migration_success:
         print("💥 Database migration failed. Application cannot start safely.")
         sys.exit(1)
+
+    # Create the admin user from SUPAKILN_BOOTSTRAP_ADMIN_EMAIL /
+    # _PASSWORD if set and no admin exists yet. Runs after migrations
+    # so the users table is guaranteed to exist.
+    try:
+        from auth import bootstrap_admin
+        bootstrap_admin()
+    except Exception as e:
+        print(f"⚠️ Admin bootstrap failed (non-fatal): {e}")
 
     # Clean up orphaned containers from previous runs/crashes
     try:

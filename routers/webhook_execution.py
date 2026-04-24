@@ -4,7 +4,7 @@ import time
 import base64
 import json
 from datetime import datetime
-from models import WebhookJob, ExecutionLog
+from models import WebhookJob, ExecutionLog, SYSTEM_USER_ID
 from database import get_db
 from services.code_executor_service import get_code_executor
 from env_manager import EnvironmentManager
@@ -120,10 +120,12 @@ async def execute_webhook(path: str, request: Request, db: Session = Depends(get
         if job.packages and job.packages.strip():
             packages = [pkg.strip() for pkg in job.packages.split(",") if pkg.strip()]
 
-        # Environment variables: user's encrypted secrets + request data
-        # for non-Python languages.
+        owner_user_id = job.owner_user_id or SYSTEM_USER_ID
+
+        # Environment variables: owner's encrypted secrets + request
+        # data for non-Python languages.
         env_manager = get_env_manager()
-        env_vars = dict(env_manager.get_all_variables())
+        env_vars = dict(env_manager.get_all_variables(owner_user_id=owner_user_id))
         if language != "python":
             env_vars["SUPAKILN_REQUEST_DATA"] = request_data_json
 
@@ -136,6 +138,7 @@ async def execute_webhook(path: str, request: Request, db: Session = Depends(get
             timeout=timeout_s,
             env_vars=env_vars,
             language=language,
+            user_id=owner_user_id,
         )
 
         success = bool(exec_result.get("success"))
@@ -168,6 +171,7 @@ async def execute_webhook(path: str, request: Request, db: Session = Depends(get
         # Log the execution
         log = ExecutionLog(
             webhook_job_id=job.id,
+            owner_user_id=owner_user_id,
             code=job.code,
             output=json.dumps(response_data) if success else None,
             error=error_output if not success else None,
@@ -194,6 +198,7 @@ async def execute_webhook(path: str, request: Request, db: Session = Depends(get
         # Log the error
         log = ExecutionLog(
             webhook_job_id=job.id if 'job' in locals() else None,
+            owner_user_id=(job.owner_user_id if 'job' in locals() and job else SYSTEM_USER_ID),
             code=job.code if 'job' in locals() else "",
             error=str(e),
             execution_time=time.time() - start_time,

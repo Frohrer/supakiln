@@ -3,9 +3,10 @@ from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
 from models.schemas import ScheduledJobRequest, ScheduledJobResponse
-from models import ScheduledJob
+from models import ScheduledJob, User
 from database import get_db
 from scheduler import scheduler
+from auth import current_user
 import languages as lang_registry
 
 router = APIRouter(prefix="/jobs", tags=["scheduled-jobs"])
@@ -40,8 +41,23 @@ def _job_to_response(job: ScheduledJob) -> dict:
     }
 
 
+def _scoped(db: Session, user: User):
+    """Return a query filtered to rows the user can see.
+
+    Admins see every job; non-admins only see their own.
+    """
+    q = db.query(ScheduledJob)
+    if not user.is_admin:
+        q = q.filter(ScheduledJob.owner_user_id == user.id)
+    return q
+
+
 @router.post("", response_model=ScheduledJobResponse)
-async def create_scheduled_job(request: ScheduledJobRequest, db: Session = Depends(get_db)):
+async def create_scheduled_job(
+    request: ScheduledJobRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Create a new scheduled job."""
     language = _validate_language(request.language)
     try:
@@ -55,6 +71,7 @@ async def create_scheduled_job(request: ScheduledJobRequest, db: Session = Depen
             language=language,
             created_at=datetime.now(),
             is_active=True,
+            owner_user_id=user.id,
         )
         db.add(db_job)
         db.commit()
@@ -72,23 +89,41 @@ async def create_scheduled_job(request: ScheduledJobRequest, db: Session = Depen
 
 
 @router.get("", response_model=List[ScheduledJobResponse])
-async def list_scheduled_jobs(db: Session = Depends(get_db)):
-    """List all scheduled jobs."""
-    jobs = db.query(ScheduledJob).all()
+async def list_scheduled_jobs(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """List scheduled jobs owned by the caller (admins see all)."""
+    jobs = _scoped(db, user).all()
     return [_job_to_response(job) for job in jobs]
 
+
 @router.get("/{job_id}", response_model=ScheduledJobResponse)
-async def get_scheduled_job(job_id: int, db: Session = Depends(get_db)):
+async def get_scheduled_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Get a specific scheduled job."""
-    job = db.query(ScheduledJob).filter(ScheduledJob.id == job_id).first()
+    job = _scoped(db, user).filter(ScheduledJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    return _job_to_response(job)
+
 
 @router.put("/{job_id}", response_model=ScheduledJobResponse)
-async def update_scheduled_job(job_id: int, request: ScheduledJobRequest, db: Session = Depends(get_db)):
+async def update_scheduled_job(
+    job_id: int,
+    request: ScheduledJobRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Update a scheduled job."""
     language = _validate_language(request.language)
+    # Verify ownership before letting the scheduler update anything.
+    existing = _scoped(db, user).filter(ScheduledJob.id == job_id).first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Job not found")
     try:
         job = scheduler.update_job(
             job_id,
@@ -108,11 +143,19 @@ async def update_scheduled_job(job_id: int, request: ScheduledJobRequest, db: Se
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.delete("/{job_id}")
-async def delete_scheduled_job(job_id: int):
+async def delete_scheduled_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Delete a scheduled job."""
+    existing = _scoped(db, user).filter(ScheduledJob.id == job_id).first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Job not found")
     try:
         scheduler.delete_job(job_id)
         return {"message": "Job deleted successfully"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))
