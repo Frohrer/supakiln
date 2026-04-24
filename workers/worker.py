@@ -94,25 +94,28 @@ def _reap_leftover_state(own_pid: int, own_script_path: str | None) -> None:
     except OSError:
         pass
 
-    # 2) Wipe /tmp and /home/codeuser. Keep the directories themselves
-    # (tmpfs mount points must exist). Don't delete the script path if
-    # we haven't removed it yet — the caller handles it.
-    for root in ("/tmp", "/home/codeuser"):
-        try:
-            for name in os.listdir(root):
-                path = os.path.join(root, name)
-                if path == own_script_path:
-                    continue
-                try:
-                    if os.path.isdir(path) and not os.path.islink(path):
-                        import shutil
-                        shutil.rmtree(path, ignore_errors=True)
-                    else:
-                        os.unlink(path)
-                except OSError:
-                    pass
-        except OSError:
-            pass
+    # 2) Wipe /tmp between calls. /home/codeuser is intentionally NOT
+    # wiped: runtimes (Go, npm, pip) keep their compile/module caches
+    # there and resetting them would turn every call into a cold
+    # build. Cross-call state isolation is about processes (handled by
+    # the pkill above) and scratch files (/tmp); /home is already a
+    # fresh tmpfs at container start, so any persistence is bounded
+    # by the idle-TTL restart anyway.
+    try:
+        for name in os.listdir("/tmp"):
+            path = os.path.join("/tmp", name)
+            if path == own_script_path:
+                continue
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    import shutil
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.unlink(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _run_code(code: str, env: dict, timeout_ms: int) -> dict:
@@ -251,7 +254,34 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, result)
 
 
+def _ensure_runtime_dirs() -> None:
+    """Recreate directories runtimes expect under $HOME.
+
+    The Dockerfile `mkdir`s these at build time, but we mount
+    /home/codeuser as a fresh tmpfs at `docker run` — the tmpfs
+    replaces the image's home contents with an empty filesystem, so
+    `GOCACHE`/`GOPATH`/`GOTMPDIR` vanish on every container start.
+    Recreate anything pointed to by a well-known env var here, before
+    user code tries to use it.
+    """
+    candidates = [
+        os.environ.get("GOCACHE"),
+        os.environ.get("GOPATH"),
+        os.environ.get("GOTMPDIR"),
+        os.environ.get("npm_config_cache"),
+        os.environ.get("PIP_CACHE_DIR"),
+    ]
+    for d in candidates:
+        if not d:
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            print(f"[supakiln-worker] could not create {d}: {e}", flush=True)
+
+
 def main() -> None:
+    _ensure_runtime_dirs()
     port = int(os.environ.get("SUPAKILN_WORKER_PORT", DEFAULT_PORT))
     bind = os.environ.get("SUPAKILN_WORKER_BIND", "0.0.0.0")
     server = ThreadingHTTPServer((bind, port), Handler)
