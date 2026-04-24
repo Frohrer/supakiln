@@ -28,7 +28,25 @@ services:
     privileged: true
     environment:
       - DOCKER_TLS_CERTDIR=""  # Disable TLS for simplicity
+    # IMPORTANT: arg 1 must literally be `dockerd`. The docker:dind
+    # entrypoint does critical setup (tini as pid 1, iptables modprobe,
+    # stale PID cleanup, cgroup v2 prep) only when it recognises that
+    # shape — wrapping in `sh -c` bypasses all of it and leaves the
+    # cgroup hierarchy half-configured, breaking any `--memory`/`--cpus`
+    # containers. To enable userns-remap or other daemon flags, edit
+    # ./security/daemon.json (mounted read-only into /etc/docker/ below).
     command: ["dockerd", "--host=tcp://0.0.0.0:2376", "--host=unix:///var/run/docker.sock"]
+    volumes:
+      # Ship the seccomp profile (and any future AppArmor/policy files)
+      # onto the dind filesystem so `docker run --security-opt seccomp=…`
+      # resolves against a path dockerd can read (it also has to be on
+      # the client side — see backend service). Mounted read-only so a
+      # compromised dind process can't tamper with the profile.
+      - ./security:/etc/supakiln:ro
+      # Optional dockerd config file. If present and non-empty it is
+      # picked up at dockerd startup; userns-remap lives here. Template
+      # in repo at security/daemon.json.example.
+      - ./security/daemon.json:/etc/docker/daemon.json:ro
     deploy:
       resources:
         limits:
@@ -52,6 +70,11 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
+      # Docker's `--security-opt seccomp=…` path is resolved by the
+      # client, not the daemon — the backend reads the profile content
+      # and sends it in the API call. Mount the same ro path here as
+      # on docker-daemon so both sides agree on /etc/supakiln/.
+      - ./security:/etc/supakiln:ro
     environment:
       - DOCKER_HOST=tcp://docker-daemon:2376
       - BACKEND_URL=${BACKEND_URL}
@@ -64,6 +87,25 @@ services:
       - SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS=${SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS:-60}
       - SUPAKILN_CONTAINER_TMPFS_SIZE=${SUPAKILN_CONTAINER_TMPFS_SIZE:-128m}
       - SUPAKILN_HOME_TMPFS_SIZE=${SUPAKILN_HOME_TMPFS_SIZE:-256m}
+      # Per-user-container resource caps. These are the knobs the
+      # hardening layer reads when rendering `docker run` for user code.
+      # Leave defaults unless you have a specific reason to loosen them.
+      - SUPAKILN_MEMORY_LIMIT=${SUPAKILN_MEMORY_LIMIT:-512m}
+      - SUPAKILN_MEMORY_SWAP=${SUPAKILN_MEMORY_SWAP:-}  # defaults to =memory-limit (disables swap evasion)
+      - SUPAKILN_CPU_LIMIT=${SUPAKILN_CPU_LIMIT:-0.5}
+      - SUPAKILN_PIDS_LIMIT=${SUPAKILN_PIDS_LIMIT:-100}
+      - SUPAKILN_NOFILE_LIMIT=${SUPAKILN_NOFILE_LIMIT:-512}
+      # Seccomp profile path as seen by the dind daemon. Mounted from
+      # ./security/ via the docker-daemon service's volume.
+      - SUPAKILN_SECCOMP_PROFILE_PATH=${SUPAKILN_SECCOMP_PROFILE_PATH:-/etc/supakiln/seccomp.json}
+      # AppArmor profile name. Leave empty to keep Docker's default
+      # profile; set to a loaded profile name for DiD.
+      - SUPAKILN_APPARMOR_PROFILE=${SUPAKILN_APPARMOR_PROFILE:-}
+      # Cooked-container reaper. Probes /health on every worker on an
+      # interval; evicts ones reporting cgroup pressure >= threshold or
+      # unreachable. Set interval to 0 to disable.
+      - SUPAKILN_COOKED_REAPER_INTERVAL_SECONDS=${SUPAKILN_COOKED_REAPER_INTERVAL_SECONDS:-30}
+      - SUPAKILN_COOKED_THRESHOLD_PCT=${SUPAKILN_COOKED_THRESHOLD_PCT:-90}
       # Caps. MAX_WORKERS is the global ceiling; MAX_WORKERS_PER_USER
       # keeps one tenant from monopolising. Exceeding a cap triggers
       # synchronous LRU eviction of an idle worker; if none are idle,

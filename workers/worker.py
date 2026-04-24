@@ -21,14 +21,25 @@ The worker is language-agnostic: it is configured per-image via env vars.
                          (no auth previously → cross-worker RCE).
 
 Wire contract:
-  GET  /health  -> 200 {"status": "ok"}      (unauthenticated)
+  GET  /health  -> 200 {"status": "ok", "cooked": bool,
+                        "pids": {"current": int, "max": int|null},
+                        "memory": {"current": int, "max": int|null}}
+                  (unauthenticated). `cooked` flips to true when cgroup
+                  pressure crosses SUPAKILN_COOKED_THRESHOLD_PCT (90 by
+                  default) — the backend reaper uses this to evict
+                  containers that are one fork away from wedging.
   POST /exec    -> body: {"code": str, "env": {str: str}, "timeout_ms": int}
                   headers: X-Supakiln-Token: <secret>
                   resp: {"exit_code": int, "stdout": str, "stderr": str, "timed_out": bool}
+                  503  -> {"error": str, "cooked": true} when the container
+                          is exhausted (e.g. pid-bomb hit --pids-limit, so
+                          Popen fails with EAGAIN before we can spawn).
+                          Backend MUST evict the container on this response.
 """
 
 from __future__ import annotations
 
+import errno
 import hmac
 import json
 import os
@@ -48,11 +59,90 @@ FILE_EXT = os.environ.get("SUPAKILN_FILE_EXT", ".py")
 # (dev-only fallback). In production the backend always sets it.
 EXPECTED_TOKEN = os.environ.get("SUPAKILN_WORKER_TOKEN", "")
 
+# Cgroup v2 paths. When --pids-limit/--memory are set, the kernel exposes
+# the limits here. Reading them gives us a container's-eye view of how
+# close we are to wedging; the backend health-probe reaper uses this to
+# evict cooked workers before /exec starts failing.
+CGROUP_PIDS_CURRENT = "/sys/fs/cgroup/pids.current"
+CGROUP_PIDS_MAX = "/sys/fs/cgroup/pids.max"
+CGROUP_MEM_CURRENT = "/sys/fs/cgroup/memory.current"
+CGROUP_MEM_MAX = "/sys/fs/cgroup/memory.max"
+
+# Percent-of-limit above which we declare the container "cooked" in /health.
+# Tuned so a pid bomb that's still mid-fork trips this before the subsequent
+# /exec actually EAGAINs.
+try:
+    _COOKED_THRESHOLD = float(
+        os.environ.get("SUPAKILN_COOKED_THRESHOLD_PCT", "90")
+    ) / 100.0
+except ValueError:
+    _COOKED_THRESHOLD = 0.90
+
+# Fork/memory errnos we treat as "container is exhausted, evict me".
+# EAGAIN   = pids.max hit or RLIMIT_NPROC hit (fork bomb)
+# ENOMEM   = memory.max hit or RLIMIT_AS hit (memory bomb)
+# ENOSPC   = tmpfs full (disk bomb) — we hit this writing the source file
+_COOKED_ERRNOS = {errno.EAGAIN, errno.ENOMEM, errno.ENOSPC}
+
 
 def _build_command(file_path: str) -> list:
     """Render RUN_CMD_TEMPLATE by substituting {file}, respecting shell splitting."""
     parts = shlex.split(RUN_CMD_TEMPLATE)
     return [p.replace("{file}", file_path) for p in parts]
+
+
+def _read_int_file(path: str) -> int | None:
+    """Read an integer from a cgroup file; return None on any failure.
+
+    cgroup-v2 files hold a single integer or the literal "max". We treat
+    "max" as None (unbounded) so callers can distinguish "no limit" from
+    "limit is N".
+    """
+    try:
+        with open(path, "r") as f:
+            v = f.read().strip()
+    except OSError:
+        return None
+    if v == "max":
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+
+def _read_cgroup_pressure() -> dict:
+    """Snapshot pids/memory usage vs limits from cgroup v2.
+
+    Returns a dict with (current, max) for each resource. The backend
+    reaper treats current/max >= _COOKED_THRESHOLD as "cooked" and evicts.
+    If the cgroup files aren't readable (older kernel, non-cgroup-v2, or
+    permission wall) we return nulls rather than guessing — the backend
+    then falls back to pure reachability probing.
+    """
+    return {
+        "pids": {
+            "current": _read_int_file(CGROUP_PIDS_CURRENT),
+            "max": _read_int_file(CGROUP_PIDS_MAX),
+        },
+        "memory": {
+            "current": _read_int_file(CGROUP_MEM_CURRENT),
+            "max": _read_int_file(CGROUP_MEM_MAX),
+        },
+    }
+
+
+def _is_cooked(pressure: dict) -> bool:
+    """True iff any tracked resource is above _COOKED_THRESHOLD of its limit."""
+    for key in ("pids", "memory"):
+        entry = pressure.get(key) or {}
+        cur = entry.get("current")
+        mx = entry.get("max")
+        if not isinstance(cur, int) or not isinstance(mx, int) or mx <= 0:
+            continue
+        if cur / mx >= _COOKED_THRESHOLD:
+            return True
+    return False
 
 
 def _reap_leftover_state(own_pid: int, own_script_path: str | None) -> None:
@@ -118,15 +208,43 @@ def _reap_leftover_state(own_pid: int, own_script_path: str | None) -> None:
         pass
 
 
+class WorkerCookedError(Exception):
+    """Container-level resource exhaustion surfaced up to the HTTP handler.
+
+    Raised when Popen or the tempfile write fails with EAGAIN/ENOMEM/ENOSPC
+    — i.e. the kernel is refusing to spawn a subprocess or allocate memory
+    because the container's cgroup limits are saturated. The handler maps
+    this to HTTP 503 with cooked=true so the backend evicts us.
+    """
+
+    def __init__(self, message: str, origin: str) -> None:
+        super().__init__(message)
+        self.origin = origin
+
+
 def _run_code(code: str, env: dict, timeout_ms: int) -> dict:
-    """Write code to a temp file and exec it via RUN_CMD_TEMPLATE."""
+    """Write code to a temp file and exec it via RUN_CMD_TEMPLATE.
+
+    Raises WorkerCookedError if the container is resource-exhausted.
+    """
     timeout_s = max(0.001, timeout_ms / 1000.0)
+    fname: str | None = None
     # Use /tmp inside the container (tmpfs-friendly, always writable).
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=FILE_EXT, delete=False, dir="/tmp", encoding="utf-8"
-    ) as f:
-        f.write(code)
-        fname = f.name
+    # A disk bomb that fills the tmpfs will cause this write to ENOSPC;
+    # treat that as cooked so the backend recycles the container.
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=FILE_EXT, delete=False, dir="/tmp", encoding="utf-8"
+        ) as f:
+            f.write(code)
+            fname = f.name
+    except OSError as e:
+        if e.errno in _COOKED_ERRNOS:
+            raise WorkerCookedError(
+                f"tempfile write failed (errno={e.errno} {os.strerror(e.errno)})",
+                origin="tempfile",
+            ) from e
+        raise
 
     proc_env = os.environ.copy()
     # Caller-supplied env vars win over inherited ones. Strip the worker
@@ -140,14 +258,25 @@ def _run_code(code: str, env: dict, timeout_ms: int) -> dict:
         # group. On timeout / normal exit we kill the whole group via
         # killpg, which catches `cmd &` background subprocesses that
         # `subprocess.run`'s plain kill would otherwise leak.
-        proc = subprocess.Popen(
-            _build_command(fname),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=proc_env,
-            cwd="/tmp",
-            start_new_session=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                _build_command(fname),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=proc_env,
+                cwd="/tmp",
+                start_new_session=True,
+            )
+        except OSError as e:
+            # EAGAIN/ENOMEM on fork/exec means the cgroup is saturated.
+            # Don't bother trying again; the backend will evict and
+            # rebuild. We raise through to the handler.
+            if e.errno in _COOKED_ERRNOS:
+                raise WorkerCookedError(
+                    f"Popen failed (errno={e.errno} {os.strerror(e.errno)})",
+                    origin="popen",
+                ) from e
+            raise
         try:
             stdout, stderr = proc.communicate(timeout=timeout_s)
             return {
@@ -182,10 +311,11 @@ def _run_code(code: str, env: dict, timeout_ms: int) -> dict:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-        try:
-            os.remove(fname)
-        except OSError:
-            pass
+        if fname is not None:
+            try:
+                os.remove(fname)
+            except OSError:
+                pass
         # Final scrub: kill lingering uid-1000 processes the user may
         # have nohup'd outside the process group, and wipe scratch dirs.
         _reap_leftover_state(own_pid=os.getpid(), own_script_path=None)
@@ -206,7 +336,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._json(200, {"status": "ok"})
+            # /health is unauthenticated: it's the reachability probe the
+            # backend uses when it can't afford a round-trip token check
+            # (cold start, reaper sweep). Cgroup numbers are not secrets.
+            pressure = _read_cgroup_pressure()
+            self._json(200, {
+                "status": "ok",
+                "cooked": _is_cooked(pressure),
+                "pids": pressure["pids"],
+                "memory": pressure["memory"],
+            })
         else:
             self._json(404, {"error": "not found"})
 
@@ -250,7 +389,34 @@ class Handler(BaseHTTPRequestHandler):
             return
         timeout_ms = int(req.get("timeout_ms", 30000))
 
-        result = _run_code(code, env, timeout_ms)
+        try:
+            result = _run_code(code, env, timeout_ms)
+        except WorkerCookedError as e:
+            # Don't even try to recover — cooked containers cannot
+            # reliably fork. Tell the backend explicitly so it evicts
+            # instead of retrying.
+            self._json(503, {
+                "error": str(e),
+                "cooked": True,
+                "origin": e.origin,
+            })
+            return
+        # Post-exec pressure check. The 503/cooked path above only fires
+        # when OUR Popen hits EAGAIN — i.e. pids.max is saturated at the
+        # moment we try to spawn. A subtler failure mode leaves Popen
+        # succeeding (the Python subprocess machinery forks exactly
+        # once) but the user process's downstream forks thrash against
+        # the cgroup limit: bash prints `fork: retry: Resource
+        # temporarily unavailable`, the call times out, we return 200
+        # with timed_out=true. The container is still cooked — zombies
+        # pin pids.current, orphaned shells hold file descriptors — and
+        # the next call will fail the same way. Piggyback on the
+        # already-paid /exec round-trip to tell the backend to evict.
+        pressure = _read_cgroup_pressure()
+        if _is_cooked(pressure):
+            result = dict(result)
+            result["cooked"] = True
+            result["pressure"] = pressure
         self._json(200, result)
 
 

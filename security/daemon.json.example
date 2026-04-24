@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Opt-in dockerd config for supakiln's dind daemon.",
+    "Mounted read-only at /etc/docker/daemon.json by docker-compose.yml.",
+    "",
+    "To enable a knob: copy this file to ./security/daemon.json and",
+    "remove the _comment (dockerd ignores unknown keys but will reject",
+    "the file if it can't parse every field).",
+    "",
+    "After editing, run: docker compose restart docker-daemon",
+    "",
+    "WARNING: enabling userns-remap invalidates all cached user-code",
+    "images because every file's owning UID changes. Plan a maintenance",
+    "window — first-call cold starts will rebuild every image."
+  ],
+  "userns-remap": "default",
+  "no-new-privileges": true,
+  "icc": false
+}

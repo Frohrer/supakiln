@@ -24,6 +24,7 @@ class JobScheduler:
             self._schedule_cleanup_job()
             self._schedule_worker_reaper()
             self._schedule_pressure_reaper()
+            self._schedule_cooked_reaper()
             self._initialized = True
 
     def _schedule_cleanup_job(self):
@@ -87,6 +88,62 @@ class JobScheduler:
             "Scheduled worker idle reaper (ttl=%.0fs, interval=%.0fs)",
             idle_ttl, interval,
         )
+
+    def _schedule_cooked_reaper(self):
+        """Periodically probe /health on every worker and evict cooked ones.
+
+        The hot path already evicts on a cooked 503 from /exec, so this
+        reaper is the backstop for two failure modes the hot path misses:
+
+          1) The container went cooked while idle (e.g. a pid bomb in a
+             previous call left orphan forks pinning the pids cgroup).
+             No /exec arrives so no 503 ever fires. Without this sweep
+             the worker stays in our cache indefinitely and the next
+             user call inherits a wedged container.
+
+          2) The worker process itself died without the container exiting
+             (OOM of pid 1, kernel bug). Connection probes fail; the
+             reaper tears down the zombie container.
+
+        Runs often — default 30s — since the goal is "a cooked container
+        is never live for more than one reaper interval". Configure with
+        SUPAKILN_COOKED_REAPER_INTERVAL_SECONDS; set to 0 to disable.
+        """
+        import os
+        from services.code_executor_service import get_code_executor
+
+        try:
+            interval = float(
+                os.environ.get("SUPAKILN_COOKED_REAPER_INTERVAL_SECONDS", "30")
+            )
+        except ValueError:
+            interval = 30.0
+
+        if interval <= 0:
+            logger.info(
+                "Cooked reaper disabled "
+                "(SUPAKILN_COOKED_REAPER_INTERVAL_SECONDS <= 0)"
+            )
+            return
+
+        def _cooked_wrapper():
+            try:
+                reaped = get_code_executor().reap_cooked_workers()
+                if reaped:
+                    logger.warning(
+                        "Cooked reaper evicted %d worker(s): %s",
+                        len(reaped), reaped,
+                    )
+            except Exception:
+                logger.exception("Cooked reaper failed")
+
+        self.scheduler.add_job(
+            _cooked_wrapper,
+            IntervalTrigger(seconds=interval),
+            id="__cooked_reaper",
+            replace_existing=True,
+        )
+        logger.info("Scheduled cooked-worker reaper (interval=%.0fs)", interval)
 
     def _schedule_pressure_reaper(self):
         """Periodically evict idle workers when the host is under load.

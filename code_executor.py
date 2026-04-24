@@ -31,6 +31,42 @@ DEFAULT_TMPFS_SIZE = os.environ.get("SUPAKILN_CONTAINER_TMPFS_SIZE", "128m")
 # because Go alone needs tens of MB for its stdlib archive cache.
 DEFAULT_HOME_TMPFS_SIZE = os.environ.get("SUPAKILN_HOME_TMPFS_SIZE", "256m")
 
+# RLIMIT_NOFILE is per-process — safe to set low on a per-container basis.
+DEFAULT_NOFILE_LIMIT = int(os.environ.get("SUPAKILN_NOFILE_LIMIT", "512"))
+# Process cap comes from --pids-limit (pids cgroup, per-container).
+# DO NOT add --ulimit nproc: RLIMIT_NPROC is counted per-UID across the
+# entire host kernel, and when userns-remap is off our container UID
+# 1000 collides with the host's UID 1000. The host already has dozens
+# of processes, so a `--ulimit nproc=100` container fails `pthread_create`
+# on first incoming connection (ThreadingHTTPServer → RuntimeError:
+# can't start new thread). The pids cgroup is the correct control.
+DEFAULT_PIDS_LIMIT = int(os.environ.get("SUPAKILN_PIDS_LIMIT", "100"))
+DEFAULT_MEMORY_LIMIT = os.environ.get("SUPAKILN_MEMORY_LIMIT", "512m")
+DEFAULT_CPU_LIMIT = os.environ.get("SUPAKILN_CPU_LIMIT", "0.5")
+
+# Seccomp profile path as visible to the dockerd daemon. In docker-compose
+# this is bind-mounted into the `docker-daemon` service at /etc/supakiln/.
+# Setting the env var to "" or "unconfined" disables the profile (falls
+# back to the Docker default). Leaving it empty is NOT recommended.
+SECCOMP_PROFILE_PATH = os.environ.get(
+    "SUPAKILN_SECCOMP_PROFILE_PATH", "/etc/supakiln/seccomp.json"
+)
+
+# Optional AppArmor profile name. Default "" keeps the Docker default
+# profile (docker-default) in play; set to a loaded profile name on the
+# host for defense-in-depth. Setting "unconfined" is the opt-out.
+APPARMOR_PROFILE = os.environ.get("SUPAKILN_APPARMOR_PROFILE", "")
+
+# Threshold above which a health probe considers a worker "cooked" and
+# triggers eviction. Mirrors the value the worker itself uses; kept in
+# sync so the backend and worker agree on when to give up.
+try:
+    COOKED_THRESHOLD = float(
+        os.environ.get("SUPAKILN_COOKED_THRESHOLD_PCT", "90")
+    ) / 100.0
+except ValueError:
+    COOKED_THRESHOLD = 0.90
+
 
 class WorkerUnreachableError(Exception):
     """Raised when the worker container's HTTP endpoint is unreachable.
@@ -38,6 +74,18 @@ class WorkerUnreachableError(Exception):
     Distinct from errors in user code (non-zero exit / stderr / timeouts):
     those are returned as normal results. This is for "the worker process
     itself isn't there anymore" — we should evict the cache and recreate.
+    """
+
+
+class WorkerCookedError(WorkerUnreachableError):
+    """Raised when the worker reports container-level resource exhaustion.
+
+    Subclass of WorkerUnreachableError so the existing self-heal retry
+    loop in `execute_code` treats cooked containers exactly like
+    unreachable ones: evict, rebuild, try once more. The distinction is
+    purely for telemetry — we want to log 'cooked' separately from
+    'unreachable' so operators can tell pid/mem bombs apart from
+    container crashes.
     """
 
 
@@ -114,6 +162,58 @@ class CodeExecutor:
         print(f"🔒 Container network mode: {self.container_network_mode}")
         self._base_image_ready = False
         
+    @staticmethod
+    def _hardening_run_flags() -> List[str]:
+        """Return the `docker run` flags that harden a user-code container.
+
+        Centralised so every `docker run` path — worker path and the
+        legacy web-service path — gets the same treatment. An operator
+        that adds a flag here is guaranteed to cover both.
+
+        Fills in:
+          * Memory: hard limit + swap set equal to memory (disables swap
+            evasion of memory.max).
+          * CPU: quota limit.
+          * Process/FD ulimits as belt-and-suspenders next to --pids-limit.
+          * Cap-drop ALL + no-new-privileges (blocks setuid escalation).
+          * Read-only rootfs.
+          * Seccomp profile (pinned via SUPAKILN_SECCOMP_PROFILE_PATH).
+          * AppArmor profile if one is named (default keeps docker-default).
+          * User 1000:1000 (non-root inside the container).
+        """
+        # Empty env var → mirror the memory limit. docker-compose passes
+        # "" for unset keys so we can't rely on .get() defaults alone.
+        memory_swap = os.environ.get("SUPAKILN_MEMORY_SWAP", "") or DEFAULT_MEMORY_LIMIT
+        flags = [
+            "--memory", DEFAULT_MEMORY_LIMIT,
+            # Setting swap = memory is the only way to disable swap on a
+            # per-container basis; otherwise the kernel is free to push
+            # memory.max-capped pages into swap, defeating the limit.
+            "--memory-swap", memory_swap,
+            "--cpus", DEFAULT_CPU_LIMIT,
+            "--user", "1000:1000",
+            "--cap-drop", "ALL",
+            "--pids-limit", str(DEFAULT_PIDS_LIMIT),
+            "--ulimit", f"nofile={DEFAULT_NOFILE_LIMIT}:{DEFAULT_NOFILE_LIMIT}",
+            # See the comment at DEFAULT_PIDS_LIMIT: no --ulimit nproc.
+            "--security-opt", "no-new-privileges",
+            "--read-only",
+        ]
+        # Pinned seccomp profile. We prefer this over Docker's built-in
+        # default because: (a) we can deny extras (io_uring, clone3),
+        # (b) it's versioned in-repo so prod drift is visible.
+        if SECCOMP_PROFILE_PATH and SECCOMP_PROFILE_PATH != "unconfined":
+            flags += ["--security-opt", f"seccomp={SECCOMP_PROFILE_PATH}"]
+        elif SECCOMP_PROFILE_PATH == "unconfined":
+            flags += ["--security-opt", "seccomp=unconfined"]
+        # AppArmor is only wired if an operator opts in — loading a
+        # profile is a host-level prereq we can't do here. Omitting the
+        # flag keeps docker-default in play on hosts where AppArmor is
+        # enabled at all.
+        if APPARMOR_PROFILE:
+            flags += ["--security-opt", f"apparmor={APPARMOR_PROFILE}"]
+        return flags
+
     def _run_docker_command(self, command: List[str], timeout: int = 30) -> Tuple[bool, str, Optional[str]]:
         """Run a Docker command and return (success, output, error)."""
         try:
@@ -666,6 +766,77 @@ USER codeuser
                 break
         return reaped
 
+    def _probe_worker_health(self, host: str, port: int, timeout_s: float = 1.0) -> Dict:
+        """GET /health from a worker; return the parsed payload or {"_unreachable": True}.
+
+        `/health` is unauthenticated by design — the backend hits it on a
+        schedule without paying the per-worker token lookup, and the
+        payload contains cgroup numbers that aren't secrets. The reaper
+        uses the reply to decide whether to evict.
+        """
+        url = f"http://{host}:{port}/health"
+        try:
+            r = self._http.get(url, timeout=timeout_s)
+        except requests.RequestException as e:
+            return {"_unreachable": True, "_error": str(e)}
+        if r.status_code != 200:
+            return {"_unreachable": True, "_error": f"status={r.status_code}"}
+        try:
+            return r.json()
+        except ValueError:
+            return {"_unreachable": True, "_error": "non-JSON /health"}
+
+    def reap_cooked_workers(self) -> List[str]:
+        """Evict workers whose cgroup pressure puts them near wedging.
+
+        Runs on a schedule from scheduler.py. For each tracked worker
+        that is not currently in an /exec call, GET /health. Evict if:
+          * the worker is flat unreachable (container crashed without
+            us noticing, dind daemon restart, network wedge)
+          * the worker reports cooked=true (pids or memory >= threshold)
+
+        Skips busy workers: eviction in the middle of an /exec tears the
+        connection out from under the caller. The reaper runs every
+        30-60s so a busy-but-cooked worker gets caught on the next
+        sweep, once its in-flight request returns (or 503s, which the
+        hot path already evicts on).
+
+        Returns the list of container_ids reaped, for logging.
+        """
+        reaped: List[str] = []
+        for container_id, meta in list(self.worker_meta.items()):
+            if self._is_busy(container_id):
+                continue
+            endpoint = self.worker_endpoints.get(container_id)
+            if endpoint is None:
+                # No endpoint recorded — the cache entry is already
+                # half-torn-down. Finish the job.
+                self._evict_worker(meta["cache_key"], container_id)
+                reaped.append(container_id)
+                continue
+            host, port = endpoint
+            report = self._probe_worker_health(host, port)
+            if report.get("_unreachable"):
+                logger.warning(
+                    "Cooked-reaper: worker %s unreachable (%s); evicting",
+                    container_id[:12], report.get("_error"),
+                )
+                self._evict_worker(meta["cache_key"], container_id)
+                reaped.append(container_id)
+                continue
+            if report.get("cooked"):
+                logger.warning(
+                    "Cooked-reaper: worker %s cooked (pids=%s/%s, mem=%s/%s); evicting",
+                    container_id[:12],
+                    (report.get("pids") or {}).get("current"),
+                    (report.get("pids") or {}).get("max"),
+                    (report.get("memory") or {}).get("current"),
+                    (report.get("memory") or {}).get("max"),
+                )
+                self._evict_worker(meta["cache_key"], container_id)
+                reaped.append(container_id)
+        return reaped
+
     def reap_cpu_pressure(self) -> List[str]:
         """Evict LRU idle workers while 1-min load exceeds SUPAKILN_CPU_HIGH_WATER.
 
@@ -754,23 +925,14 @@ USER codeuser
             worker_token = secrets.token_urlsafe(32)
 
             t_run = perf_counter()
-            success, output, error = self._run_docker_command([
+            run_cmd = [
                 "docker", "run",
                 "-d",
                 "--label", APP_LABEL,
-                "--memory", "512m",
-                "--cpus", "0.5",
                 "--network", "bridge",  # worker needs network; dind bridge only
-                "--user", "1000:1000",
-                "--cap-drop", "ALL",
-                "--pids-limit", "100",
-                # Block setuid escalation via /usr/bin/su, passwd, etc.
-                "--security-opt", "no-new-privileges",
-                # Rootfs read-only; writable areas are explicit tmpfs
-                # mounts. A future Dockerfile regression that chowns a
-                # system dir to codeuser no longer becomes a persistence
-                # vector.
-                "--read-only",
+            ]
+            run_cmd += self._hardening_run_flags()
+            run_cmd += [
                 # Tmpfs for /tmp so user code can't indefinitely grow the
                 # container's writable layer. 128m is enough for realistic
                 # scratch work; override with SUPAKILN_CONTAINER_TMPFS_SIZE.
@@ -792,7 +954,8 @@ USER codeuser
                 "-e", f"SUPAKILN_WORKER_TOKEN={worker_token}",
                 "-p", str(runtime.worker_port),  # publish to random host port on dind
                 image_tag,
-            ])
+            ]
+            success, output, error = self._run_docker_command(run_cmd)
             timings['docker_run_ms'] = (perf_counter() - t_run) * 1000
             if not success:
                 raise Exception(f"Failed to create worker container: {error}")
@@ -847,13 +1010,21 @@ USER codeuser
         env_vars: Dict[str, str],
         timeout_ms: int,
         token: Optional[str] = None,
-    ) -> Tuple[bool, Optional[str], Optional[str], bool]:
-        """POST code to the worker; return (success, stdout, stderr, timed_out).
+    ) -> Tuple[bool, Optional[str], Optional[str], bool, bool]:
+        """POST code to the worker; return (success, stdout, stderr, timed_out, cooked).
 
         Raises WorkerUnreachableError if the worker HTTP endpoint can't be
         reached at all — the caller should evict cache and retry. Does NOT
         raise for user-code failures (non-zero exit, stderr, timed_out);
         those come back as normal return values.
+
+        The `cooked` flag is set when the worker reports post-exec cgroup
+        pressure above the threshold. This is distinct from 503+cooked
+        (raised as WorkerCookedError): that path means Popen itself
+        EAGAIN'd; this path means Popen worked but user code wedged the
+        cgroup. In both cases the caller should evict — the difference
+        is that `cooked=true` on a 200 means we still have a valid
+        result to return to the user.
         """
         url = f"http://{host}:{port}/exec"
         # Worker enforces timeout on its side; we give the HTTP client a
@@ -878,10 +1049,29 @@ USER codeuser
             # code took too long" or "worker stuck"; treat the latter as
             # a user-visible timeout rather than an unreachable marker,
             # because the container is usually still alive.
-            return False, None, "worker HTTP request timed out", True
+            return False, None, "worker HTTP request timed out", True, False
         except requests.RequestException as e:
-            return False, None, f"worker request failed: {e}", False
+            return False, None, f"worker request failed: {e}", False, False
 
+        if r.status_code == 503:
+            # The worker explicitly told us the container is cooked —
+            # cgroup pressure at limit, fork/alloc failing. Surface the
+            # dedicated exception so callers can log it as "cooked" vs
+            # "unreachable"; both trigger the same eviction path.
+            cooked_payload: Dict = {}
+            try:
+                cooked_payload = r.json()
+            except ValueError:
+                pass
+            if cooked_payload.get("cooked"):
+                raise WorkerCookedError(
+                    f"worker reports cooked: origin={cooked_payload.get('origin')} "
+                    f"error={cooked_payload.get('error')}"
+                )
+            # Non-cooked 503 — still unreachable, still evict.
+            raise WorkerUnreachableError(
+                f"worker returned status {r.status_code}: {r.text[:200]}"
+            )
         if r.status_code >= 500:
             # Server-side error from the worker; the process may be in a
             # bad state. Treat as unreachable so the caller recreates.
@@ -889,17 +1079,18 @@ USER codeuser
                 f"worker returned status {r.status_code}: {r.text[:200]}"
             )
         if r.status_code != 200:
-            return False, None, f"worker returned status {r.status_code}: {r.text}", False
+            return False, None, f"worker returned status {r.status_code}: {r.text}", False, False
         try:
             body = r.json()
         except ValueError:
-            return False, None, f"worker returned non-JSON: {r.text[:200]}", False
+            return False, None, f"worker returned non-JSON: {r.text[:200]}", False, False
         success = body.get("exit_code") == 0 and not body.get("timed_out", False)
         return (
             success,
             body.get("stdout"),
             body.get("stderr"),
             bool(body.get("timed_out", False)),
+            bool(body.get("cooked", False)),
         )
 
     def _execute_with_timeout(self, container_id: str, command: str, timeout: int) -> Tuple[bool, str, Optional[str]]:
@@ -1155,20 +1346,30 @@ USER codeuser
             for key, value in env_vars.items():
                 env_options.extend(["-e", f"{key}={value}"])
             
-            success, output, error = self._run_docker_command([
+            # Web-service path uses the same hardening set as ad-hoc
+            # workers. /tmp needs exec here because the startup scripts
+            # are shebang scripts the kernel execves — unlike the worker
+            # path where only the Go toolchain needs exec (and it uses
+            # /home/codeuser for that). Everything else user code
+            # produces still lives on read-only rootfs + size-capped tmpfs.
+            run_cmd = [
                 "docker", "run",
                 "-d",
                 "-p", port_mapping,
                 "--label", APP_LABEL,
-                "--memory", "512m",
-                "--cpus", "0.5",
-                "--user", "1000:1000",
-                "--cap-drop", "ALL",
-                "--pids-limit", "100"  # Limit number of processes (keep reasonable limit)
-            ] + network_options + env_options + [
+            ]
+            run_cmd += self._hardening_run_flags()
+            run_cmd += [
+                "--tmpfs", f"/tmp:exec,size={DEFAULT_TMPFS_SIZE},mode=1777",
+                "--tmpfs",
+                f"/home/codeuser:exec,size={DEFAULT_HOME_TMPFS_SIZE},"
+                f"mode=0755,uid=1000,gid=1000",
+            ]
+            run_cmd += network_options + env_options + [
                 image_tag,
                 "tail", "-f", "/dev/null"
-            ])
+            ]
+            success, output, error = self._run_docker_command(run_cmd)
             
             if not success:
                 return {
@@ -1497,7 +1698,7 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                 try:
                     meta_for_token = self.worker_meta.get(container_id, {})
                     try:
-                        success, stdout, stderr, timed_out = self._exec_via_worker(
+                        success, stdout, stderr, timed_out, cooked = self._exec_via_worker(
                             host, port, code, env_vars,
                             timeout_ms=int(timeout * 1000),
                             token=meta_for_token.get("worker_token"),
@@ -1509,6 +1710,19 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                         meta = self.worker_meta.get(container_id)
                         if meta is not None:
                             meta["last_used"] = time.time()
+                        if cooked:
+                            # Worker completed the call but its cgroup is
+                            # saturated post-exec (e.g. zombies pinning
+                            # pids.current after a fork bomb). Return the
+                            # result to the user, but evict the container
+                            # so the NEXT call gets a fresh one rather
+                            # than inheriting the cooked state.
+                            logger.warning(
+                                "Post-exec cooked on %s; evicting so next "
+                                "call rebuilds the container", container_id[:12],
+                            )
+                            timings['cooked_post_exec'] = 1.0
+                            self._evict_worker(cache_key, container_id)
                         break
                     except WorkerUnreachableError as e:
                         last_unreachable = e
