@@ -227,6 +227,14 @@ def _run_code(code: str, env: dict, timeout_ms: int) -> dict:
 
     Raises WorkerCookedError if the container is resource-exhausted.
     """
+    # Re-ensure runtime cache dirs exist. They're created at worker
+    # startup but live on a tmpfs that user code can write into; a prior
+    # call may have filled the tmpfs (triggering ENOSPC cascades that
+    # delete siblings) or explicitly `rm -rf`'d part of $HOME. makedirs
+    # with exist_ok is idempotent and ~microseconds, so pay it on every
+    # call rather than debugging "go: creating work dir" errors later.
+    _ensure_runtime_dirs()
+
     timeout_s = max(0.001, timeout_ms / 1000.0)
     fname: str | None = None
     # Use /tmp inside the container (tmpfs-friendly, always writable).
