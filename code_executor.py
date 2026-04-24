@@ -26,6 +26,10 @@ APP_LABEL = "managed-by=supakiln"
 # Default tmpfs size for the worker container's /tmp. Caps how much
 # scratch space user code can consume inside a single container.
 DEFAULT_TMPFS_SIZE = os.environ.get("SUPAKILN_CONTAINER_TMPFS_SIZE", "128m")
+# /home/codeuser is a separate tmpfs that backs runtime caches
+# (Go compile cache, pip/npm caches, …). Sized larger than /tmp
+# because Go alone needs tens of MB for its stdlib archive cache.
+DEFAULT_HOME_TMPFS_SIZE = os.environ.get("SUPAKILN_HOME_TMPFS_SIZE", "256m")
 
 
 class WorkerUnreachableError(Exception):
@@ -772,9 +776,19 @@ USER codeuser
                 # scratch work; override with SUPAKILN_CONTAINER_TMPFS_SIZE.
                 "--tmpfs", f"/tmp:size={DEFAULT_TMPFS_SIZE},mode=1777",
                 # Writable home, also tmpfs so it resets with the
-                # container. Keeps install-free languages (bash, go)
-                # working when they want a writable $HOME.
-                "--tmpfs", "/home/codeuser:size=16m,mode=0755,uid=1000,gid=1000",
+                # container. Sized large enough for Go's stdlib
+                # archive cache + typical pip/npm caches; the per-call
+                # cleanup explicitly does NOT wipe /home so these
+                # caches persist across calls.
+                #
+                # `exec` is required because `go run` compiles the user
+                # program into $GOTMPDIR and then exec()s the binary —
+                # our /tmp stays noexec (default) to block arbitrary
+                # binary execution from scratch, but /home/codeuser is
+                # a real runtime cache dir so it needs exec.
+                "--tmpfs",
+                f"/home/codeuser:exec,size={DEFAULT_HOME_TMPFS_SIZE},"
+                f"mode=0755,uid=1000,gid=1000",
                 "-e", f"SUPAKILN_WORKER_TOKEN={worker_token}",
                 "-p", str(runtime.worker_port),  # publish to random host port on dind
                 image_tag,
