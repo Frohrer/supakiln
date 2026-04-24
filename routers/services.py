@@ -3,22 +3,40 @@ from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
 from models.schemas import PersistentServiceRequest, PersistentServiceResponse
-from models import PersistentService
+from models import PersistentService, User
 from database import get_db
 from services.service_manager import service_manager
 from services.docker_client import docker_client
+from auth import current_user
 
 router = APIRouter(prefix="/services", tags=["persistent-services"])
 
+
+def _scoped(db: Session, user: User):
+    q = db.query(PersistentService)
+    if not user.is_admin:
+        q = q.filter(PersistentService.owner_user_id == user.id)
+    return q
+
+
 @router.post("", response_model=PersistentServiceResponse)
-async def create_persistent_service(request: PersistentServiceRequest, db: Session = Depends(get_db)):
+async def create_persistent_service(
+    request: PersistentServiceRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Create a new persistent service."""
     try:
-        # Check if name already exists
-        existing = db.query(PersistentService).filter(PersistentService.name == request.name).first()
+        # Service name is unique per-user (not globally); the caller's
+        # own services must not collide, but alice and bob can both
+        # have one named "worker".
+        existing = db.query(PersistentService).filter(
+            PersistentService.name == request.name,
+            PersistentService.owner_user_id == user.id,
+        ).first()
         if existing:
             raise HTTPException(status_code=400, detail="Service name already exists")
-        
+
         # Create service in database
         db_service = PersistentService(
             name=request.name,
@@ -30,7 +48,8 @@ async def create_persistent_service(request: PersistentServiceRequest, db: Sessi
             auto_start=1 if request.auto_start else 0,
             created_at=datetime.now(),
             is_active=True,
-            status="stopped"
+            status="stopped",
+            owner_user_id=user.id,
         )
         db.add(db_service)
         db.commit()
@@ -57,9 +76,12 @@ async def create_persistent_service(request: PersistentServiceRequest, db: Sessi
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("", response_model=List[PersistentServiceResponse])
-async def list_persistent_services(db: Session = Depends(get_db)):
-    """List all persistent services."""
-    services = db.query(PersistentService).all()
+async def list_persistent_services(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """List persistent services owned by the caller (admins see all)."""
+    services = _scoped(db, user).all()
     return [
         {
             "id": service.id,
@@ -81,9 +103,13 @@ async def list_persistent_services(db: Session = Depends(get_db)):
     ]
 
 @router.get("/{service_id}", response_model=PersistentServiceResponse)
-async def get_persistent_service(service_id: int, db: Session = Depends(get_db)):
+async def get_persistent_service(
+    service_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Get a specific persistent service."""
-    service = db.query(PersistentService).filter(PersistentService.id == service_id).first()
+    service = _scoped(db, user).filter(PersistentService.id == service_id).first()
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
     return {
@@ -104,17 +130,23 @@ async def get_persistent_service(service_id: int, db: Session = Depends(get_db))
     }
 
 @router.put("/{service_id}", response_model=PersistentServiceResponse)
-async def update_persistent_service(service_id: int, request: PersistentServiceRequest, db: Session = Depends(get_db)):
+async def update_persistent_service(
+    service_id: int,
+    request: PersistentServiceRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Update a persistent service."""
     try:
-        service = db.query(PersistentService).filter(PersistentService.id == service_id).first()
+        service = _scoped(db, user).filter(PersistentService.id == service_id).first()
         if not service:
             raise HTTPException(status_code=404, detail="Service not found")
-        
-        # Check if name already exists (excluding current service)
+
+        # Name is unique per-owner; check only within the caller's namespace.
         existing = db.query(PersistentService).filter(
             PersistentService.name == request.name,
-            PersistentService.id != service_id
+            PersistentService.owner_user_id == service.owner_user_id,
+            PersistentService.id != service_id,
         ).first()
         if existing:
             raise HTTPException(status_code=400, detail="Service name already exists")
@@ -152,10 +184,14 @@ async def update_persistent_service(service_id: int, request: PersistentServiceR
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/{service_id}")
-async def delete_persistent_service(service_id: int, db: Session = Depends(get_db)):
+async def delete_persistent_service(
+    service_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Delete a persistent service."""
     try:
-        service = db.query(PersistentService).filter(PersistentService.id == service_id).first()
+        service = _scoped(db, user).filter(PersistentService.id == service_id).first()
         if not service:
             raise HTTPException(status_code=404, detail="Service not found")
         
@@ -172,46 +208,79 @@ async def delete_persistent_service(service_id: int, db: Session = Depends(get_d
 
 # Service control endpoints
 @router.post("/{service_id}/start")
-async def start_persistent_service(service_id: int, db: Session = Depends(get_db)):
+async def start_persistent_service(
+    service_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Start a persistent service."""
     try:
+        # Enforce ownership before touching the manager.
+        svc = _scoped(db, user).filter(PersistentService.id == service_id).first()
+        if not svc:
+            raise HTTPException(status_code=404, detail="Service not found")
         success = service_manager.start_service(service_id, db)
         if success:
             return {"message": "Service start initiated"}
-        else:
-            raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail="Service not found")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/{service_id}/stop")
-async def stop_persistent_service(service_id: int, db: Session = Depends(get_db)):
+async def stop_persistent_service(
+    service_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Stop a persistent service."""
     try:
+        svc = _scoped(db, user).filter(PersistentService.id == service_id).first()
+        if not svc:
+            raise HTTPException(status_code=404, detail="Service not found")
         success = service_manager.stop_service(service_id, db)
         if success:
             return {"message": "Service stopped"}
-        else:
-            raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail="Service not found")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/{service_id}/restart")
-async def restart_persistent_service(service_id: int, db: Session = Depends(get_db)):
+async def restart_persistent_service(
+    service_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Restart a persistent service."""
     try:
+        svc = _scoped(db, user).filter(PersistentService.id == service_id).first()
+        if not svc:
+            raise HTTPException(status_code=404, detail="Service not found")
         success = service_manager.restart_service(service_id, db)
         if success:
             return {"message": "Service restart initiated"}
-        else:
-            raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail="Service not found")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.get("/{service_id}/logs")
-async def get_service_logs(service_id: int, limit: int = 100, db: Session = Depends(get_db)):
+async def get_service_logs(
+    service_id: int,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Get logs for a specific service."""
     try:
-        service = db.query(PersistentService).filter(PersistentService.id == service_id).first()
+        service = _scoped(db, user).filter(PersistentService.id == service_id).first()
         if not service:
             raise HTTPException(status_code=404, detail="Service not found")
         

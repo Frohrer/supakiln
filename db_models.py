@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, Float, create_engine
+from sqlalchemy import Column, Integer, String, DateTime, Text, Float, ForeignKey, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -6,53 +6,103 @@ import os
 
 Base = declarative_base()
 
+
+# The `system` user is the default owner for rows created before auth
+# existed, and the attribution target for any unauthenticated request
+# while SUPAKILN_ALLOW_ANONYMOUS=true (transition period). id=1 is
+# reserved for it by the migration.
+SYSTEM_USER_ID = 1
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), unique=True, nullable=False)
+    # argon2 hash; NULL for the `system` pseudo-user (cannot log in).
+    password_hash = Column(Text)
+    is_admin = Column(Integer, default=0, nullable=False)
+    disabled = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    # sha256 of the full token (hex). The plaintext is returned exactly
+    # once at creation and never stored.
+    hashed_key = Column(String(64), unique=True, nullable=False)
+    # First 12 chars of the plaintext token (e.g. "supa_ABCDEFG"),
+    # safe to show in listings.
+    prefix = Column(String(32), nullable=False)
+    label = Column(String(100))
+    # "api" (long-lived, user-managed) or "session" (login-issued,
+    # shorter-lived, not user-CRUD-able).
+    kind = Column(String(20), default="api", nullable=False)
+    expires_at = Column(DateTime)  # NULL => never expires
+    last_used_at = Column(DateTime)
+    revoked_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class EnvironmentVariable(Base):
     __tablename__ = "environment_variables"
-    
+
     id = Column(Integer, primary_key=True)
-    name = Column(String(100), unique=True, nullable=False)
+    # name is unique PER user (composite unique in the SQL schema), not
+    # globally, so alice and bob can both have a SECRET_KEY. See the v10
+    # migration.
+    name = Column(String(100), nullable=False)
     value = Column(Text, nullable=False)  # Encrypted value
     description = Column(Text)  # Optional description
+    owner_user_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class ScheduledJob(Base):
     __tablename__ = "scheduled_jobs"
-    
+
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     code = Column(Text, nullable=False)
     cron_expression = Column(String(100), nullable=False)
     container_id = Column(String(100))
     packages = Column(Text)  # Stored as comma-separated string
+    owner_user_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     last_run = Column(DateTime)
     is_active = Column(Integer, default=1)  # 1 for active, 0 for inactive
     timeout = Column(Integer, default=30)  # Timeout in seconds
+    language = Column(String(20), default="python")
 
 class WebhookJob(Base):
     __tablename__ = "webhook_jobs"
-    
+
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     endpoint = Column(String(200), unique=True, nullable=False)  # URL path like /webhook/my-job
     code = Column(Text, nullable=False)
     container_id = Column(String(100))
     packages = Column(Text)  # Stored as comma-separated string
+    owner_user_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     last_triggered = Column(DateTime)
     is_active = Column(Integer, default=1)  # 1 for active, 0 for inactive
     timeout = Column(Integer, default=30)  # Timeout in seconds
     description = Column(Text)  # Optional description
+    language = Column(String(20), default="python")
 
 class PersistentService(Base):
     __tablename__ = "persistent_services"
-    
+
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     code = Column(Text, nullable=False)
     container_id = Column(String(100))
     packages = Column(Text)  # Stored as comma-separated string
+    owner_user_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime)
     last_restart = Column(DateTime)
@@ -62,6 +112,7 @@ class PersistentService(Base):
     description = Column(Text)  # Optional description
     process_id = Column(String(100))  # Docker exec process ID for running services
     auto_start = Column(Integer, default=1)  # 1 to auto-start on system startup
+    language = Column(String(20), default="python")
 
 class ExposedPort(Base):
     __tablename__ = "exposed_ports"
@@ -80,11 +131,12 @@ class ExposedPort(Base):
 
 class ExecutionLog(Base):
     __tablename__ = "execution_logs"
-    
+
     id = Column(Integer, primary_key=True)
     job_id = Column(Integer)  # Null for manual executions
     webhook_job_id = Column(Integer)  # For webhook job executions
     service_id = Column(Integer)  # For persistent service executions
+    owner_user_id = Column(Integer, ForeignKey("users.id"))
     code = Column(Text, nullable=False)
     output = Column(Text)
     error = Column(Text)

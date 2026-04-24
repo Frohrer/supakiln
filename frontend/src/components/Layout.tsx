@@ -6,6 +6,7 @@ import {
   Typography,
   Container,
   Box,
+  Button,
   IconButton,
   Drawer,
   List,
@@ -13,8 +14,14 @@ import {
   ListItemButton,
   ListItemText,
   Divider,
+  Tooltip,
+  Chip,
 } from '@mui/material';
-import { Menu as MenuIcon } from '@mui/icons-material';
+import {
+  Menu as MenuIcon,
+  Logout as LogoutIcon,
+} from '@mui/icons-material';
+import { useAuth } from '../auth/AuthContext';
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -23,16 +30,36 @@ interface LayoutProps {
 const Layout: React.FC<LayoutProps> = ({ children }) => {
   const navigate = useNavigate();
   const location = useLocation();
+  const { user, logout } = useAuth();
   const [drawerOpen, setDrawerOpen] = useState(false);
 
+  // System user (id=1) is the anonymous-fallback identity; a real
+  // logged-in user has id >= 2. Reflect that in the UI so operators can
+  // tell at a glance whether they're authenticated or riding on the
+  // anonymous-mode convenience.
+  const isAnonymous = !user || user.id === 1;
+
+  const handleLogout = async () => {
+    await logout();
+    // After logout, the guard decides whether to show login or keep
+    // anonymous — we don't hardcode a destination here.
+    navigate('/');
+  };
+
+  // Nav: hide auth-gated items for anonymous users, hide admin items
+  // unless the caller is admin. Keeps the drawer tidy for the common
+  // case.
   const navItems = [
     { path: '/', label: 'Editor' },
     { path: '/saved-code', label: 'Saved Code' },
     { path: '/containers', label: 'Running Containers' },
     { path: '/scheduler', label: 'Scheduler' },
     { path: '/webhooks', label: 'Webhooks' },
+    { path: '/workers', label: 'Workers' },
     { path: '/logs', label: 'Logs' },
     { path: '/env', label: 'Environment Variables' },
+    ...(!isAnonymous ? [{ path: '/keys', label: 'API Keys' }] : []),
+    ...(user?.is_admin ? [{ path: '/admin/users', label: 'Admin: Users' }] : []),
   ];
 
   const handleDrawerToggle = () => {
@@ -93,6 +120,48 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
           <Typography variant="h6" component="div" sx={{ flexGrow: 1, fontSize: '1.1rem' }}>
             Python Code Execution Engine
           </Typography>
+
+          {user && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Tooltip
+                title={
+                  isAnonymous
+                    ? 'Running as the system user (anonymous mode). ' +
+                      'Sign in to get your own isolated containers.'
+                    : user.is_admin
+                      ? 'Signed in as admin'
+                      : 'Signed in'
+                }
+              >
+                <Chip
+                  size="small"
+                  label={isAnonymous ? 'anonymous' : user.email}
+                  color={isAnonymous ? 'default' : user.is_admin ? 'secondary' : 'primary'}
+                  variant={isAnonymous ? 'outlined' : 'filled'}
+                />
+              </Tooltip>
+              {isAnonymous ? (
+                <Button
+                  size="small"
+                  color="inherit"
+                  onClick={() => navigate('/login')}
+                >
+                  Sign in
+                </Button>
+              ) : (
+                <Tooltip title="Sign out">
+                  <IconButton
+                    size="small"
+                    color="inherit"
+                    onClick={handleLogout}
+                    aria-label="sign out"
+                  >
+                    <LogoutIcon fontSize="small" />
+                  </IconButton>
+                </Tooltip>
+              )}
+            </Box>
+          )}
         </Toolbar>
       </AppBar>
       

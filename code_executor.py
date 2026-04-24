@@ -3,25 +3,106 @@ import os
 import json
 import time
 import hashlib
+import secrets
 import threading
 import base64
 import docker
 import random
 import logging
+import requests
+from time import perf_counter
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from urllib.parse import urlparse
 from services.docker_client import docker_client
+from languages import get as get_runtime
+from languages.base import Runtime, build_package_install_snippet
 
 logger = logging.getLogger(__name__)
 
 # Label used to identify containers managed by this app
 APP_LABEL = "managed-by=supakiln"
 
+# Default tmpfs size for the worker container's /tmp. Caps how much
+# scratch space user code can consume inside a single container.
+DEFAULT_TMPFS_SIZE = os.environ.get("SUPAKILN_CONTAINER_TMPFS_SIZE", "128m")
+
+
+class WorkerUnreachableError(Exception):
+    """Raised when the worker container's HTTP endpoint is unreachable.
+
+    Distinct from errors in user code (non-zero exit / stderr / timeouts):
+    those are returned as normal results. This is for "the worker process
+    itself isn't there anymore" — we should evict the cache and recreate.
+    """
+
+
+class WorkerCapError(Exception):
+    """Raised when worker count caps prevent creating a new container.
+
+    Carries an `http_status` (429 for per-user cap, 503 for global) so the
+    API layer can map to the right response code.
+    """
+
+    def __init__(self, message: str, http_status: int):
+        super().__init__(message)
+        self.http_status = http_status
+
+
+def _worker_host_from_env() -> str:
+    """Resolve the hostname the backend uses to reach user-container published ports.
+
+    In the docker-compose/dind setup, published ports bind on the dind
+    daemon's host (the `docker-daemon` service). If DOCKER_HOST is a TCP
+    URL, its hostname is that. Otherwise (host docker socket), user
+    containers publish to localhost.
+    """
+    override = os.environ.get("SUPAKILN_WORKER_HOST")
+    if override:
+        return override
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host.startswith("tcp://"):
+        parsed = urlparse(docker_host)
+        return parsed.hostname or "localhost"
+    return "localhost"
+
+
 class CodeExecutor:
     def __init__(self, image_name: str = "python-executor"):
+        # Legacy image name retained for the web-service execution path,
+        # which still uses the pre-existing `python-executor:*` images.
         self.image_name = image_name
-        self.containers: Dict[str, str] = {}  # package_hash -> container_id
+        # Legacy cache: package_hash -> container_id (used by web services
+        # and debug endpoints). Kept for backwards compatibility.
+        self.containers: Dict[str, str] = {}
         self.web_service_containers: Dict[str, Dict] = {}  # container_id -> service_info
+
+        # Worker-path cache: "lang:package_hash" -> container_id
+        self.worker_containers: Dict[str, str] = {}
+        # Worker endpoints: container_id -> (host, port) to reach its HTTP API
+        self.worker_endpoints: Dict[str, Tuple[str, int]] = {}
+        # Per-container metadata the lifecycle API surfaces: language,
+        # package_hash, cache_key, created_at, last_used. Updated on
+        # creation and on every /exec call.
+        self.worker_meta: Dict[str, Dict] = {}
+        # HTTP session with connection pooling so each /exec POST reuses a
+        # TCP connection to the worker when possible.
+        self._http = requests.Session()
+        self._worker_host = _worker_host_from_env()
+        # Concurrency: one lock per cache_key guards cold-start so parallel
+        # first-time requests for the same (language, packages) don't both
+        # build+run, leaving one orphan. The guard-lock protects the dict
+        # of per-key locks; per-key locks protect slow work.
+        self._cache_lock_guard = threading.Lock()
+        self._cache_locks: Dict[str, threading.Lock] = {}
+
+        # In-flight /exec calls per container. The evictor (cap-enforcer
+        # and pressure reaper) will never pick a container with
+        # busy_count > 0. Incremented before returning from
+        # `_get_or_create_worker_container`; decremented in the caller's
+        # `finally`. Protected by _busy_lock.
+        self._busy_counts: Dict[str, int] = {}
+        self._busy_lock = threading.Lock()
 
         # Network mode configuration (defaults to 'none' for security)
         # Can be set to 'bridge' to allow network access when needed
@@ -242,6 +323,571 @@ USER codeuser
         
         return f"Failed to build image with packages: {', '.join(packages)}\n\nFull error: {docker_error}"
 
+    # ------------------------------------------------------------------
+    # Runtime + worker path (ad-hoc execution, multi-language)
+    #
+    # Each supported language has its own base image (e.g.
+    # `supakiln-python:base`) with a long-running HTTP worker baked in as
+    # CMD. Backend talks to the worker directly over the dind bridge
+    # (via published ports), bypassing `docker exec` on the hot path.
+    # ------------------------------------------------------------------
+
+    def _ensure_runtime_base_image(self, runtime: Runtime) -> None:
+        """Build the runtime's base image if it isn't already present.
+
+        We always hit `docker image inspect` here — caching "ready=True"
+        in-process lets an image get deleted externally (by `docker rmi`,
+        GC, or a cleanup sweep) and leaves us with a stale Yes that
+        fails on the next `docker run`. The inspect is ~5ms, cheap
+        enough to do on the cold-start path.
+        """
+        tag = runtime.base_image_tag
+        success, _, _ = self._run_docker_command(["docker", "image", "inspect", tag])
+        if success:
+            return
+        print(f"Building {tag} from {runtime.dockerfile_path}...")
+        success, _, error = self._run_docker_command(
+            ["docker", "build", "-t", tag, "-f", runtime.dockerfile_path, "."],
+            timeout=600,
+        )
+        if not success:
+            raise Exception(f"Failed to build {tag}: {error}")
+
+    def _build_runtime_image(self, runtime: Runtime, packages: List[str]) -> str:
+        """Return an image tag for `runtime + packages`, building if needed."""
+        self._ensure_runtime_base_image(runtime)
+        if not packages:
+            return runtime.base_image_tag
+
+        package_hash = self._get_package_hash(packages)
+        base_name = runtime.base_image_tag.split(":", 1)[0]
+        image_tag = f"{base_name}:{package_hash}"
+
+        success, _, _ = self._run_docker_command(["docker", "image", "inspect", image_tag])
+        if success:
+            return image_tag
+
+        install_snippet = build_package_install_snippet(runtime, packages)
+        if not install_snippet:
+            # Runtime doesn't support package installation; callers should
+            # not be passing packages, but fall back to base image rather
+            # than erroring.
+            return runtime.base_image_tag
+
+        dockerfile_content = (
+            f"FROM {runtime.base_image_tag}\n"
+            f"{install_snippet}"
+        )
+        tmp_path = f"Dockerfile.{runtime.name}.{package_hash}.tmp"
+        with open(tmp_path, "w") as f:
+            f.write(dockerfile_content)
+        try:
+            success, _, error = self._run_docker_command(
+                ["docker", "build", "-t", image_tag, "-f", tmp_path, "."],
+                timeout=600,
+            )
+            if not success:
+                raise Exception(self._parse_docker_build_error(error, packages))
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        return image_tag
+
+    def _read_worker_port(self, container_id: str, worker_port: int) -> int:
+        """Read the published host-port for the worker container."""
+        container = docker_client.containers.get(container_id)
+        container.reload()
+        port_info = (container.attrs.get("NetworkSettings", {})
+                     .get("Ports", {})
+                     .get(f"{worker_port}/tcp"))
+        if not port_info:
+            raise Exception(f"worker port {worker_port} not published on {container_id[:12]}")
+        return int(port_info[0]["HostPort"])
+
+    def _wait_for_worker_health(self, host: str, port: int, timeout_s: float = 15.0) -> None:
+        """Poll GET /health until 200 or timeout."""
+        deadline = perf_counter() + timeout_s
+        url = f"http://{host}:{port}/health"
+        last_err: Optional[str] = None
+        while perf_counter() < deadline:
+            try:
+                r = self._http.get(url, timeout=1.0)
+                if r.status_code == 200:
+                    return
+                last_err = f"status={r.status_code}"
+            except requests.RequestException as e:
+                last_err = str(e)
+            time.sleep(0.05)
+        raise Exception(f"worker at {host}:{port} not healthy after {timeout_s}s ({last_err})")
+
+    def _get_cache_lock(self, cache_key: str) -> threading.Lock:
+        """Return the lock for this cache_key, creating it lazily."""
+        with self._cache_lock_guard:
+            lock = self._cache_locks.get(cache_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._cache_locks[cache_key] = lock
+            return lock
+
+    def _evict_worker(self, cache_key: str, container_id: Optional[str]) -> None:
+        """Forget a worker and force-remove its container (best effort).
+
+        Called when we detect the worker is unreachable or we explicitly
+        want to tear it down. Must be idempotent: the container may
+        already be gone.
+        """
+        self.worker_containers.pop(cache_key, None)
+        # Only pop endpoints if this container_id still owns it; a racing
+        # recreation could have updated it already.
+        if container_id is not None:
+            cur = self.worker_endpoints.get(container_id)
+            if cur is not None:
+                self.worker_endpoints.pop(container_id, None)
+            self.worker_meta.pop(container_id, None)
+            if self.containers.get(cache_key) == container_id:
+                self.containers.pop(cache_key, None)
+            try:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_id],
+                    capture_output=True, env=os.environ.copy(),
+                    timeout=15,
+                )
+            except Exception as e:
+                logger.debug("best-effort rm failed for %s: %s", container_id, e)
+
+    # ------------------------------------------------------------------
+    # Busy-count tracking.
+    #
+    # We must NOT evict a worker that is mid-call — that would racily tear
+    # the container out from under an in-flight request. `_mark_busy` is
+    # called right before returning from `_get_or_create_worker_container`
+    # so there is no gap between "I'm using this worker" and "it's marked
+    # busy". The caller (`execute_code`) drops it in a `finally`.
+    # ------------------------------------------------------------------
+
+    def _mark_busy(self, container_id: str) -> None:
+        with self._busy_lock:
+            self._busy_counts[container_id] = (
+                self._busy_counts.get(container_id, 0) + 1
+            )
+
+    def _mark_idle(self, container_id: str) -> None:
+        with self._busy_lock:
+            cur = self._busy_counts.get(container_id, 0)
+            if cur <= 1:
+                self._busy_counts.pop(container_id, None)
+            else:
+                self._busy_counts[container_id] = cur - 1
+
+    def _is_busy(self, container_id: str) -> bool:
+        with self._busy_lock:
+            return self._busy_counts.get(container_id, 0) > 0
+
+    # ------------------------------------------------------------------
+    # Cap enforcement + pressure eviction.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_caps() -> Tuple[int, int]:
+        """Read (max_global, max_per_user) from env on every call.
+
+        Defaults are intentionally modest — a single-host dind has a
+        hard memory ceiling, and each worker holds ~50MB idle + up to
+        the 512MB --memory limit. 50 workers × ~100MB working-set is
+        already ~5GB. 5/user prevents one tenant from monopolising.
+        """
+        try:
+            mx = int(os.environ.get("SUPAKILN_MAX_WORKERS", "50"))
+        except ValueError:
+            mx = 50
+        try:
+            mxu = int(os.environ.get("SUPAKILN_MAX_WORKERS_PER_USER", "5"))
+        except ValueError:
+            mxu = 5
+        return mx, mxu
+
+    def _user_workers(self, user_id: int) -> List[Tuple[str, Dict]]:
+        return [
+            (cid, meta)
+            for cid, meta in self.worker_meta.items()
+            if meta.get("user_id") == user_id
+        ]
+
+    def _evict_for_caps(self, user_id: int) -> None:
+        """Make room before creating a new worker for `user_id`.
+
+        Per-user cap fires first (most common quota trigger); global cap
+        catches the aggregate. In both cases we pick the LRU idle worker
+        to evict. If all candidates are busy, raise WorkerCapError so
+        the API can return 429/503 and the client can retry.
+
+        Must be called with the caller's cache_lock already held — this
+        keeps eviction and new-container-creation atomic for the same
+        cache_key.
+        """
+        max_global, max_per_user = self._get_caps()
+
+        # Per-user cap. Evict the caller's own LRU idle worker first; if
+        # none of theirs are idle, refuse.
+        user_workers = self._user_workers(user_id)
+        if len(user_workers) >= max_per_user:
+            idle = [(cid, m) for cid, m in user_workers if not self._is_busy(cid)]
+            if not idle:
+                raise WorkerCapError(
+                    f"per-user worker cap reached "
+                    f"({max_per_user}) and all are busy",
+                    http_status=429,
+                )
+            idle.sort(key=lambda pair: pair[1]["last_used"])
+            victim_cid, victim_meta = idle[0]
+            logger.info(
+                "Cap-evicting user %s's LRU worker %s (cache_key=%s)",
+                user_id, victim_cid[:12], victim_meta["cache_key"],
+            )
+            self._evict_worker(victim_meta["cache_key"], victim_cid)
+
+        # Global cap. Evict the globally-LRU idle worker, which may or
+        # may not belong to this user.
+        if len(self.worker_meta) >= max_global:
+            idle = [
+                (cid, m) for cid, m in self.worker_meta.items()
+                if not self._is_busy(cid)
+            ]
+            if not idle:
+                raise WorkerCapError(
+                    f"global worker cap reached "
+                    f"({max_global}) and all are busy",
+                    http_status=503,
+                )
+            idle.sort(key=lambda pair: pair[1]["last_used"])
+            victim_cid, victim_meta = idle[0]
+            logger.info(
+                "Cap-evicting global LRU worker %s (user=%s, cache_key=%s)",
+                victim_cid[:12],
+                victim_meta.get("user_id"),
+                victim_meta["cache_key"],
+            )
+            self._evict_worker(victim_meta["cache_key"], victim_cid)
+
+    # ------------------------------------------------------------------
+    # Pressure reapers (called by the scheduler's background thread).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_host_memory_pct() -> Optional[float]:
+        """Return used-memory fraction (0..1) from /proc/meminfo.
+
+        Uses MemAvailable when present (it's the kernel's own estimate
+        of "memory that can be allocated without swapping"), which is
+        the right signal for eviction decisions. Falls back to
+        Total-Free-Cached-Buffers on older kernels.
+        """
+        try:
+            with open("/proc/meminfo", "r") as f:
+                fields = {}
+                for line in f:
+                    k, _, rest = line.partition(":")
+                    v = rest.strip().split()
+                    if v:
+                        try:
+                            fields[k] = int(v[0])
+                        except ValueError:
+                            pass
+        except OSError:
+            return None
+        total = fields.get("MemTotal")
+        if not total:
+            return None
+        avail = fields.get("MemAvailable")
+        if avail is None:
+            free = fields.get("MemFree", 0)
+            cached = fields.get("Cached", 0)
+            buffers = fields.get("Buffers", 0)
+            avail = free + cached + buffers
+        used = total - avail
+        return max(0.0, min(1.0, used / total))
+
+    @staticmethod
+    def _read_host_loadavg_1m() -> Optional[float]:
+        try:
+            with open("/proc/loadavg", "r") as f:
+                parts = f.read().split()
+            if parts:
+                return float(parts[0])
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _idle_lru(self) -> List[Tuple[str, Dict]]:
+        """Return non-busy workers sorted oldest-used-first."""
+        idle = [
+            (cid, m) for cid, m in self.worker_meta.items()
+            if not self._is_busy(cid)
+        ]
+        idle.sort(key=lambda pair: pair[1]["last_used"])
+        return idle
+
+    def reap_memory_pressure(self) -> List[str]:
+        """Evict LRU idle workers while host memory is above high water.
+
+        Two thresholds avoid thrash:
+          SUPAKILN_MEMORY_HIGH_WATER_PCT  start reaping when used > this
+          SUPAKILN_MEMORY_LOW_WATER_PCT   stop when used drops below
+        Returns the list of container_ids reaped (empty if nothing to do).
+        """
+        try:
+            high = float(os.environ.get("SUPAKILN_MEMORY_HIGH_WATER_PCT", "85")) / 100.0
+        except ValueError:
+            high = 0.85
+        try:
+            low = float(os.environ.get("SUPAKILN_MEMORY_LOW_WATER_PCT", "70")) / 100.0
+        except ValueError:
+            low = 0.70
+        if low >= high:
+            low = max(0.0, high - 0.10)
+
+        used = self._read_host_memory_pct()
+        if used is None or used < high:
+            return []
+
+        reaped: List[str] = []
+        for cid, meta in self._idle_lru():
+            self._evict_worker(meta["cache_key"], cid)
+            reaped.append(cid)
+            # Re-check after each eviction; the kernel is slow to
+            # reclaim tmpfs pages, so we don't always see a drop
+            # immediately. Cap the batch at len(idle) workers.
+            used = self._read_host_memory_pct()
+            if used is not None and used <= low:
+                break
+        return reaped
+
+    def reap_cpu_pressure(self) -> List[str]:
+        """Evict LRU idle workers while 1-min load exceeds SUPAKILN_CPU_HIGH_WATER.
+
+        Default high water is `nproc * 1.5`, i.e. "hosts is noticeably
+        overloaded but not dead". Unlike memory this is often transient;
+        the reaper runs often enough that a single spike is tolerable.
+        """
+        default_high = float(os.cpu_count() or 1) * 1.5
+        try:
+            high = float(
+                os.environ.get("SUPAKILN_CPU_HIGH_WATER", str(default_high))
+            )
+        except ValueError:
+            high = default_high
+
+        load = self._read_host_loadavg_1m()
+        if load is None or load < high:
+            return []
+
+        reaped: List[str] = []
+        # Evict at most 25% of idle workers per tick to avoid cliffs.
+        idle = self._idle_lru()
+        budget = max(1, len(idle) // 4)
+        for cid, meta in idle[:budget]:
+            self._evict_worker(meta["cache_key"], cid)
+            reaped.append(cid)
+        return reaped
+
+    def _get_or_create_worker_container(
+        self,
+        runtime: Runtime,
+        packages: List[str],
+        timings: Dict[str, float],
+        user_id: int,
+    ) -> Tuple[str, str, int]:
+        """Return (container_id, worker_host, worker_port), creating if needed.
+
+        Cold-start is serialized per cache_key so parallel first-time
+        requests don't each build+run, leaving one orphan.
+
+        `user_id` is part of the cache key: every tenant gets their own
+        worker container for a given (language, packages). This is the
+        primary multi-tenant isolation boundary — one user's filesystem,
+        process, and network state never touch another's.
+        """
+        package_hash = self._get_package_hash(packages)
+        cache_key = f"{runtime.name}:u{user_id}:{package_hash}"
+
+        # Fast path: cache hit without acquiring the per-key lock.
+        if cache_key in self.worker_containers:
+            container_id = self.worker_containers[cache_key]
+            host, port = self.worker_endpoints[container_id]
+            timings['container_cache_hit'] = 1.0
+            # Mark busy BEFORE returning so a concurrent evictor doesn't
+            # pick this container in the window between return and the
+            # caller's subsequent _exec_via_worker call.
+            self._mark_busy(container_id)
+            return container_id, host, port
+
+        lock = self._get_cache_lock(cache_key)
+        with lock:
+            # Double-check: another thread may have populated the cache
+            # while we were waiting for the lock.
+            if cache_key in self.worker_containers:
+                container_id = self.worker_containers[cache_key]
+                host, port = self.worker_endpoints[container_id]
+                timings['container_cache_hit'] = 1.0
+                self._mark_busy(container_id)
+                return container_id, host, port
+
+            timings['container_cache_hit'] = 0.0
+
+            # About to create a new worker — make room first. This may
+            # raise WorkerCapError(429/503), which bubbles up cleanly.
+            self._evict_for_caps(user_id)
+
+            t_build = perf_counter()
+            image_tag = self._build_runtime_image(runtime, packages)
+            timings['build_image_ms'] = (perf_counter() - t_build) * 1000
+
+            # Mint a one-time shared secret and pass it as an env var.
+            # The worker enforces it on /exec; sibling containers on the
+            # same dind bridge no longer have an unauthenticated escape
+            # hatch to each other. secrets.token_urlsafe returns ~43
+            # chars of entropy from 32 bytes.
+            worker_token = secrets.token_urlsafe(32)
+
+            t_run = perf_counter()
+            success, output, error = self._run_docker_command([
+                "docker", "run",
+                "-d",
+                "--label", APP_LABEL,
+                "--memory", "512m",
+                "--cpus", "0.5",
+                "--network", "bridge",  # worker needs network; dind bridge only
+                "--user", "1000:1000",
+                "--cap-drop", "ALL",
+                "--pids-limit", "100",
+                # Block setuid escalation via /usr/bin/su, passwd, etc.
+                "--security-opt", "no-new-privileges",
+                # Rootfs read-only; writable areas are explicit tmpfs
+                # mounts. A future Dockerfile regression that chowns a
+                # system dir to codeuser no longer becomes a persistence
+                # vector.
+                "--read-only",
+                # Tmpfs for /tmp so user code can't indefinitely grow the
+                # container's writable layer. 128m is enough for realistic
+                # scratch work; override with SUPAKILN_CONTAINER_TMPFS_SIZE.
+                "--tmpfs", f"/tmp:size={DEFAULT_TMPFS_SIZE},mode=1777",
+                # Writable home, also tmpfs so it resets with the
+                # container. Keeps install-free languages (bash, go)
+                # working when they want a writable $HOME.
+                "--tmpfs", "/home/codeuser:size=16m,mode=0755,uid=1000,gid=1000",
+                "-e", f"SUPAKILN_WORKER_TOKEN={worker_token}",
+                "-p", str(runtime.worker_port),  # publish to random host port on dind
+                image_tag,
+            ])
+            timings['docker_run_ms'] = (perf_counter() - t_run) * 1000
+            if not success:
+                raise Exception(f"Failed to create worker container: {error}")
+            container_id = output.strip()
+
+            try:
+                t_port = perf_counter()
+                host_port = self._read_worker_port(container_id, runtime.worker_port)
+                timings['read_port_ms'] = (perf_counter() - t_port) * 1000
+
+                host = self._worker_host
+                t_health = perf_counter()
+                self._wait_for_worker_health(host, host_port)
+                timings['worker_health_ms'] = (perf_counter() - t_health) * 1000
+            except Exception:
+                # If we couldn't bring the worker up, don't leave the
+                # container running as an orphan.
+                try:
+                    subprocess.run(
+                        ["docker", "rm", "-f", container_id],
+                        capture_output=True, env=os.environ.copy(), timeout=15,
+                    )
+                except Exception:
+                    pass
+                raise
+
+            self.worker_containers[cache_key] = container_id
+            self.worker_endpoints[container_id] = (host, host_port)
+            now = time.time()
+            self.worker_meta[container_id] = {
+                "language": runtime.name,
+                "package_hash": package_hash,
+                "cache_key": cache_key,
+                "user_id": user_id,
+                "created_at": now,
+                "last_used": now,
+                "worker_token": worker_token,
+            }
+            # Also register in the legacy `containers` dict so existing code
+            # (debug endpoints, container_id lookups) still works.
+            self.containers[cache_key] = container_id
+            # Mark busy before returning — same rationale as the cache-
+            # hit path. The caller's `finally` pairs it with _mark_idle.
+            self._mark_busy(container_id)
+            return container_id, host, host_port
+
+    def _exec_via_worker(
+        self,
+        host: str,
+        port: int,
+        code: str,
+        env_vars: Dict[str, str],
+        timeout_ms: int,
+        token: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str], bool]:
+        """POST code to the worker; return (success, stdout, stderr, timed_out).
+
+        Raises WorkerUnreachableError if the worker HTTP endpoint can't be
+        reached at all — the caller should evict cache and retry. Does NOT
+        raise for user-code failures (non-zero exit, stderr, timed_out);
+        those come back as normal return values.
+        """
+        url = f"http://{host}:{port}/exec"
+        # Worker enforces timeout on its side; we give the HTTP client a
+        # small slack buffer so the server can surface a timed_out=True
+        # response rather than us hanging up.
+        http_timeout = max(1.0, timeout_ms / 1000.0 + 5.0)
+        headers = {}
+        if token:
+            headers["X-Supakiln-Token"] = token
+        try:
+            r = self._http.post(
+                url,
+                json={"code": code, "env": env_vars or {}, "timeout_ms": timeout_ms},
+                headers=headers,
+                timeout=http_timeout,
+            )
+        except requests.ConnectionError as e:
+            # Worker is gone (container died, daemon restarted, TCP reset).
+            raise WorkerUnreachableError(f"worker connection failed: {e}") from e
+        except requests.Timeout:
+            # User's code or the worker hung. This can be either "user
+            # code took too long" or "worker stuck"; treat the latter as
+            # a user-visible timeout rather than an unreachable marker,
+            # because the container is usually still alive.
+            return False, None, "worker HTTP request timed out", True
+        except requests.RequestException as e:
+            return False, None, f"worker request failed: {e}", False
+
+        if r.status_code >= 500:
+            # Server-side error from the worker; the process may be in a
+            # bad state. Treat as unreachable so the caller recreates.
+            raise WorkerUnreachableError(
+                f"worker returned status {r.status_code}: {r.text[:200]}"
+            )
+        if r.status_code != 200:
+            return False, None, f"worker returned status {r.status_code}: {r.text}", False
+        try:
+            body = r.json()
+        except ValueError:
+            return False, None, f"worker returned non-JSON: {r.text[:200]}", False
+        success = body.get("exit_code") == 0 and not body.get("timed_out", False)
+        return (
+            success,
+            body.get("stdout"),
+            body.get("stderr"),
+            bool(body.get("timed_out", False)),
+        )
+
     def _execute_with_timeout(self, container_id: str, command: str, timeout: int) -> Tuple[bool, str, Optional[str]]:
         """Execute a command in a container with timeout."""
         try:
@@ -345,27 +991,33 @@ USER codeuser
         
         return success and not timed_out, combined_output, combined_error, timed_out
     
-    def _execute_with_streaming_timeout_and_env(self, container_id: str, encoded_code: str, timeout: int, env_vars: Dict[str, str]) -> Tuple[bool, str, Optional[str], bool]:
+    def _execute_with_streaming_timeout_and_env(self, container_id: str, encoded_code: str, timeout: int, env_vars: Dict[str, str], timings: Optional[Dict[str, float]] = None) -> Tuple[bool, str, Optional[str], bool]:
         """Execute code in a container with environment variables injected at execution time."""
         import threading
         import docker
-        
+
         output_buffer = []
         error_buffer = []
         success = False
         timed_out = False
-        
+        # Shared timings dict so we can measure phases inside the worker thread
+        t = timings if timings is not None else {}
+
         def collect_output():
             nonlocal success, timed_out
             try:
+                t_get = perf_counter()
                 container = docker_client.containers.get(container_id)
+                t['containers_get_ms'] = (perf_counter() - t_get) * 1000
                 # Execute with environment variables injected at execution time
+                t_exec = perf_counter()
                 result = container.exec_run(
                     f"python3 -c 'import base64; exec(base64.b64decode(\"{encoded_code}\").decode())'",
                     environment=env_vars,  # Inject environment variables here
                     stream=False,  # Don't stream to get proper exit code
                     demux=True     # Separate stdout and stderr
                 )
+                t['exec_run_ms'] = (perf_counter() - t_exec) * 1000
                 
                 # Process the output
                 if result.output:
@@ -420,26 +1072,53 @@ USER codeuser
         
         return success and not timed_out, combined_output, combined_error, timed_out
     
-    def execute_code(self, code: str, packages: List[str], timeout: int = 30, env_vars: Dict[str, str] = None) -> Dict:
+    def execute_code(
+        self,
+        code: str,
+        packages: List[str],
+        timeout: int = 30,
+        env_vars: Dict[str, str] = None,
+        language: str = "python",
+        user_id: int = 1,
+    ) -> Dict:
         """
-        Execute Python code in a container with the specified packages.
-        
+        Execute code in a container with the specified packages.
+
         Args:
-            code: Python code to execute
-            packages: List of required Python packages
+            code: Source code to execute
+            packages: List of required packages (interpretation depends on language)
             timeout: Maximum execution time in seconds
             env_vars: Dictionary of environment variables to pass to the container
-            
+            language: Runtime to use (default "python"). Must be registered
+                      in the `languages` module.
+            user_id: Owner of this execution. Used as part of the worker
+                     cache key, so each user runs in their own container
+                     for a given (language, packages). Defaults to the
+                     system user (id=1) — callers that haven't been
+                     wired through the auth layer yet will all share it,
+                     which matches the pre-auth behaviour.
+
         Returns:
             Dict containing execution results
         """
+        t_start = perf_counter()
+        timings: Dict[str, float] = {}
+
         if env_vars is None:
             env_vars = {}
-            
+
+        t_hash = perf_counter()
         package_hash = self._get_package_hash(packages)
-        
-        # Detect if this is a web service
-        web_service = self._detect_web_service(code, packages)
+        timings['package_hash_ms'] = (perf_counter() - t_hash) * 1000
+
+        # Web-service detection only applies to Python (Streamlit/FastAPI/
+        # Flask/Dash/Gradio). Non-Python languages always take the ad-hoc
+        # worker path.
+        web_service = None
+        if language == "python":
+            t_detect = perf_counter()
+            web_service = self._detect_web_service(code, packages)
+            timings['detect_web_service_ms'] = (perf_counter() - t_detect) * 1000
         
         # For web services, always create a new container
         # For regular code, use package hash to potentially reuse containers
@@ -744,59 +1423,211 @@ export PYTHONPATH=/tmp:$PYTHONPATH
                 }
             }
         else:
-            # Regular code execution - use package hash to potentially reuse containers
-            if package_hash not in self.containers:
-                image_tag = self._build_image(packages)
-                
-                # Regular container for non-web services (no environment variables at creation)
-                success, output, error = self._run_docker_command([
-                    "docker", "run",
-                    "-d",
-                    "--label", APP_LABEL,
-                    "--memory", "512m",
-                    "--cpus", "0.5",
-                    "--network", self.container_network_mode,  # Configurable network mode
-                    "--user", "1000:1000",
-                    "--cap-drop", "ALL",  # Remove all capabilities
-                    "--pids-limit", "100"  # Limit number of processes (keep reasonable limit)
-                ] + [
-                    image_tag,
-                    "tail", "-f", "/dev/null"
-                ])
-                if not success:
+            # Ad-hoc code execution via the per-language worker. Containers
+            # are cached per (language, package_hash) so subsequent runs
+            # against the same environment reuse the live worker.
+            try:
+                runtime = get_runtime(language)
+            except KeyError as e:
+                timings['total_ms'] = (perf_counter() - t_start) * 1000
+                return {
+                    "success": False,
+                    "output": None,
+                    "error": str(e),
+                    "timings_ms": timings,
+                }
+
+            package_hash = self._get_package_hash(packages)
+            cache_key = f"{runtime.name}:u{user_id}:{package_hash}"
+
+            # We allow one automatic retry if the cached worker turns out
+            # to be dead — that's the self-heal path. A second consecutive
+            # unreachable worker is reported to the caller.
+            #
+            # Lease/busy protocol: `_get_or_create_worker_container`
+            # marks the returned container busy on our behalf. We must
+            # pair that with exactly one `_mark_idle` per attempt,
+            # regardless of which branch we exit through (success,
+            # user-code failure, timeout, or self-heal reconstruction).
+            last_unreachable: Optional[WorkerUnreachableError] = None
+            container_id: Optional[str] = None
+            for attempt in range(2):
+                try:
+                    container_id, host, port = self._get_or_create_worker_container(
+                        runtime, packages, timings, user_id,
+                    )
+                except WorkerCapError as e:
+                    # Cap-induced failure: surface the HTTP status so
+                    # the router can return 429 / 503 instead of 500.
+                    timings['total_ms'] = (perf_counter() - t_start) * 1000
                     return {
                         "success": False,
                         "output": None,
-                        "error": f"Failed to create container: {error}"
+                        "error": str(e),
+                        "http_status": e.http_status,
+                        "timings_ms": timings,
                     }
-                container_id = output.strip()
-                self.containers[package_hash] = container_id
-            
-            container_id = self.containers[package_hash]
-            
-            # Regular code execution with environment variables injected at execution time
-            encoded_code = base64.b64encode(code.encode()).decode()
-            success, output, error, timed_out = self._execute_with_streaming_timeout_and_env(container_id, encoded_code, timeout, env_vars)
-            
+                except Exception as e:
+                    timings['total_ms'] = (perf_counter() - t_start) * 1000
+                    return {
+                        "success": False,
+                        "output": None,
+                        "error": f"Failed to prepare worker container: {e}",
+                        "timings_ms": timings,
+                    }
+
+                # We now hold a busy lease on `container_id`. Use a
+                # try/finally to guarantee release along every path.
+                t_exec = perf_counter()
+                lease_cid = container_id
+                try:
+                    meta_for_token = self.worker_meta.get(container_id, {})
+                    try:
+                        success, stdout, stderr, timed_out = self._exec_via_worker(
+                            host, port, code, env_vars,
+                            timeout_ms=int(timeout * 1000),
+                            token=meta_for_token.get("worker_token"),
+                        )
+                        timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
+                        if attempt == 1:
+                            timings['self_heal_recovered'] = 1.0
+                        # Record liveness for lifecycle + idle reaper.
+                        meta = self.worker_meta.get(container_id)
+                        if meta is not None:
+                            meta["last_used"] = time.time()
+                        break
+                    except WorkerUnreachableError as e:
+                        last_unreachable = e
+                        timings['worker_exec_ms'] = (perf_counter() - t_exec) * 1000
+                        timings[f'self_heal_attempt_{attempt}'] = 1.0
+                        # Evict the dead worker. Next iteration rebuilds.
+                        self._evict_worker(cache_key, container_id)
+                        container_id = None
+                        # Loop continues to the next attempt.
+                finally:
+                    self._mark_idle(lease_cid)
+            else:
+                # Both attempts failed — worker couldn't be reached even
+                # after recreating. Surface a clear error.
+                timings['total_ms'] = (perf_counter() - t_start) * 1000
+                return {
+                    "success": False,
+                    "output": None,
+                    "error": f"Worker unreachable after retry: {last_unreachable}",
+                    "container_id": None,
+                    "timed_out": False,
+                    "timings_ms": timings,
+                }
+
+            timings['total_ms'] = (perf_counter() - t_start) * 1000
+            output = stdout if stdout else None
+            # Preserve existing contract: stderr is returned as `error` iff
+            # the process actually failed (non-zero exit or timeout); a
+            # successful run with stderr chatter still reports success.
+            error = stderr if (not success or timed_out) and stderr else None
             return {
                 "success": success,
                 "output": output,
                 "error": error,
                 "container_id": container_id,
-                "timed_out": timed_out
+                "timed_out": timed_out,
+                "timings_ms": timings,
             }
     
     def cleanup(self):
         """Clean up all tracked containers."""
         env = os.environ.copy()
-        all_ids = list(self.containers.values()) + list(self.web_service_containers.keys())
-        for container_id in all_ids:
+        all_ids = (
+            list(self.containers.values())
+            + list(self.web_service_containers.keys())
+            + list(self.worker_containers.values())
+        )
+        for container_id in set(all_ids):
             try:
                 subprocess.run(["docker", "rm", "-f", container_id], capture_output=True, env=env)
             except Exception:
                 pass
         self.containers.clear()
         self.web_service_containers.clear()
+        self.worker_containers.clear()
+        self.worker_endpoints.clear()
+        self.worker_meta.clear()
+
+    # ------------------------------------------------------------------
+    # Lifecycle API used by the /workers router and the idle reaper.
+    # ------------------------------------------------------------------
+
+    def list_workers(self, user_id: Optional[int] = None) -> List[Dict]:
+        """Return a snapshot of live ad-hoc workers.
+
+        If `user_id` is provided, only that user's workers are returned.
+        Admins should pass None to see every container.
+        """
+        out: List[Dict] = []
+        for container_id, meta in list(self.worker_meta.items()):
+            if user_id is not None and meta.get("user_id") != user_id:
+                continue
+            endpoint = self.worker_endpoints.get(container_id)
+            out.append({
+                "container_id": container_id,
+                "language": meta["language"],
+                "package_hash": meta["package_hash"],
+                "cache_key": meta["cache_key"],
+                "user_id": meta.get("user_id"),
+                "created_at": meta["created_at"],
+                "last_used": meta["last_used"],
+                "host": endpoint[0] if endpoint else None,
+                "port": endpoint[1] if endpoint else None,
+            })
+        # Stable order for UIs.
+        out.sort(key=lambda w: (w["language"], w["created_at"]))
+        return out
+
+    def stop_worker(self, container_id: str) -> bool:
+        """Force-kill one worker. Returns True if it was tracked."""
+        meta = self.worker_meta.get(container_id)
+        if meta is None:
+            # Still try to kill the container in case it's a stale one we
+            # lost track of after a backend restart.
+            try:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_id],
+                    capture_output=True, env=os.environ.copy(), timeout=15,
+                )
+            except Exception:
+                pass
+            return False
+        self._evict_worker(meta["cache_key"], container_id)
+        return True
+
+    def reset_workers(self) -> int:
+        """Stop and forget every tracked ad-hoc worker. Returns count killed."""
+        killed = 0
+        for container_id in list(self.worker_meta.keys()):
+            meta = self.worker_meta.get(container_id)
+            if meta is None:
+                continue
+            self._evict_worker(meta["cache_key"], container_id)
+            killed += 1
+        return killed
+
+    def reap_idle_workers(self, idle_ttl_seconds: float) -> List[str]:
+        """Stop workers whose last_used is older than idle_ttl_seconds.
+
+        Returns the list of container_ids that were reaped. idle_ttl <= 0
+        disables reaping (caller should skip invoking altogether in that
+        case, but we also guard here).
+        """
+        if idle_ttl_seconds <= 0:
+            return []
+        now = time.time()
+        cutoff = now - idle_ttl_seconds
+        reaped: List[str] = []
+        for container_id, meta in list(self.worker_meta.items()):
+            if meta["last_used"] < cutoff:
+                self._evict_worker(meta["cache_key"], container_id)
+                reaped.append(container_id)
+        return reaped
 
     def shutdown(self):
         """Graceful shutdown: stop and remove all tracked containers."""

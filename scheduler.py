@@ -4,7 +4,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
 import time
 import logging
-from models import SessionLocal, ScheduledJob, ExecutionLog
+from models import SessionLocal, ScheduledJob, ExecutionLog, SYSTEM_USER_ID
 from code_executor import CodeExecutor
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,8 @@ class JobScheduler:
         if not self._initialized:
             self.load_existing_jobs()
             self._schedule_cleanup_job()
+            self._schedule_worker_reaper()
+            self._schedule_pressure_reaper()
             self._initialized = True
 
     def _schedule_cleanup_job(self):
@@ -41,6 +43,109 @@ class JobScheduler:
             replace_existing=True,
         )
         logger.info("Scheduled periodic cleanup job (every 6 hours)")
+
+    def _schedule_worker_reaper(self):
+        """Periodically kill ad-hoc workers that have been idle too long.
+
+        Configured by two env vars:
+          SUPAKILN_WORKER_IDLE_TTL_SECONDS  reap threshold; <=0 disables.
+                                            Default 1800 (30 minutes).
+          SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS  how often to scan.
+                                                   Default 60.
+        """
+        import os
+        from services.code_executor_service import get_code_executor
+
+        try:
+            idle_ttl = float(os.environ.get("SUPAKILN_WORKER_IDLE_TTL_SECONDS", "1800"))
+        except ValueError:
+            idle_ttl = 1800
+        try:
+            interval = float(os.environ.get("SUPAKILN_WORKER_REAPER_INTERVAL_SECONDS", "60"))
+        except ValueError:
+            interval = 60
+
+        if idle_ttl <= 0:
+            logger.info("Worker idle reaper disabled (SUPAKILN_WORKER_IDLE_TTL_SECONDS <= 0)")
+            return
+
+        def _reap_wrapper():
+            try:
+                reaped = get_code_executor().reap_idle_workers(idle_ttl)
+                if reaped:
+                    logger.info("Reaped %d idle worker(s): %s", len(reaped), reaped)
+            except Exception:
+                logger.exception("Worker reaper failed")
+
+        self.scheduler.add_job(
+            _reap_wrapper,
+            IntervalTrigger(seconds=interval),
+            id="__worker_reaper",
+            replace_existing=True,
+        )
+        logger.info(
+            "Scheduled worker idle reaper (ttl=%.0fs, interval=%.0fs)",
+            idle_ttl, interval,
+        )
+
+    def _schedule_pressure_reaper(self):
+        """Periodically evict idle workers when the host is under load.
+
+        Memory pressure uses /proc/meminfo; CPU pressure uses
+        /proc/loadavg. Both are host-wide (container /proc reflects the
+        host's view under Docker). Two-threshold eviction with a high
+        and low water avoids thrashing. Configured by:
+
+          SUPAKILN_PRESSURE_REAPER_INTERVAL_SECONDS  scan cadence
+                                                     (default 30)
+          SUPAKILN_MEMORY_HIGH_WATER_PCT             memory trigger
+          SUPAKILN_MEMORY_LOW_WATER_PCT              memory stop
+          SUPAKILN_CPU_HIGH_WATER                    load_1m trigger
+        """
+        import os
+        from services.code_executor_service import get_code_executor
+
+        try:
+            interval = float(
+                os.environ.get("SUPAKILN_PRESSURE_REAPER_INTERVAL_SECONDS", "30")
+            )
+        except ValueError:
+            interval = 30.0
+
+        if interval <= 0:
+            logger.info(
+                "Pressure reaper disabled "
+                "(SUPAKILN_PRESSURE_REAPER_INTERVAL_SECONDS <= 0)"
+            )
+            return
+
+        def _pressure_wrapper():
+            try:
+                exec_ = get_code_executor()
+                mem_reaped = exec_.reap_memory_pressure()
+                if mem_reaped:
+                    logger.warning(
+                        "Memory-pressure reaped %d worker(s): %s",
+                        len(mem_reaped), mem_reaped,
+                    )
+                cpu_reaped = exec_.reap_cpu_pressure()
+                if cpu_reaped:
+                    logger.warning(
+                        "CPU-pressure reaped %d worker(s): %s",
+                        len(cpu_reaped), cpu_reaped,
+                    )
+            except Exception:
+                logger.exception("Pressure reaper failed")
+
+        self.scheduler.add_job(
+            _pressure_wrapper,
+            IntervalTrigger(seconds=interval),
+            id="__pressure_reaper",
+            replace_existing=True,
+        )
+        logger.info(
+            "Scheduled pressure reaper (interval=%.0fs)", interval,
+        )
 
     def load_existing_jobs(self):
         """Load all active jobs from the database and schedule them."""
@@ -70,7 +175,12 @@ class JobScheduler:
         )
 
     async def execute_job(self, job_id):
-        """Execute a scheduled job and log its results."""
+        """Execute a scheduled job and log its results.
+
+        The job runs in its owner's worker container, and the owner's
+        encrypted env vars are injected. The system user runs
+        owner-less jobs (legacy rows).
+        """
         db = SessionLocal()
         try:
             job = db.query(ScheduledJob).filter(ScheduledJob.id == job_id).first()
@@ -78,20 +188,37 @@ class JobScheduler:
                 return
 
             start_time = time.time()
-            
+            owner_user_id = job.owner_user_id or SYSTEM_USER_ID
+
+            # Pull the owner's env vars. Imported lazily to avoid a
+            # circular import at module load time.
+            from env_manager import EnvironmentManager
+            import os
+            key = None
+            if os.path.exists('.env_key'):
+                with open('.env_key', 'rb') as f:
+                    key = f.read()
+            env_vars = EnvironmentManager(db, key).get_all_variables(
+                owner_user_id=owner_user_id
+            )
+
             # Execute the code
             try:
                 result = self.executor.execute_code(
                     code=job.code,
                     packages=job.packages.split(',') if job.packages else [],
-                    timeout=getattr(job, 'timeout', 30)  # Use job timeout or default to 30
+                    timeout=getattr(job, 'timeout', 30),
+                    language=getattr(job, 'language', None) or 'python',
+                    env_vars=env_vars,
+                    user_id=owner_user_id,
                 )
-                
+
                 execution_time = time.time() - start_time
-                
+
                 # Log the execution
                 log = ExecutionLog(
                     job_id=job.id,
+                    owner_user_id=owner_user_id,
                     code=job.code,
                     output=result.get('output'),
                     error=result.get('error'),
@@ -99,15 +226,16 @@ class JobScheduler:
                     execution_time=execution_time,
                     status='success' if result.get('success') else 'error'
                 )
-                
+
                 db.add(log)
                 job.last_run = datetime.utcnow()
                 db.commit()
-                
+
             except Exception as e:
                 execution_time = time.time() - start_time
                 log = ExecutionLog(
                     job_id=job.id,
+                    owner_user_id=owner_user_id,
                     code=job.code,
                     error=str(e),
                     container_id=None,
@@ -117,11 +245,21 @@ class JobScheduler:
                 db.add(log)
                 job.last_run = datetime.utcnow()
                 db.commit()
-                
+
         finally:
             db.close()
 
-    def add_job(self, name, code, cron_expression, container_id=None, packages=None):
+    def add_job(
+        self,
+        name,
+        code,
+        cron_expression,
+        container_id=None,
+        packages=None,
+        language="python",
+        timeout=30,
+        owner_user_id=SYSTEM_USER_ID,
+    ):
         """Add a new scheduled job."""
         db = SessionLocal()
         try:
@@ -130,12 +268,15 @@ class JobScheduler:
                 code=code,
                 cron_expression=cron_expression,
                 container_id=container_id,
-                packages=','.join(packages) if packages else None
+                packages=','.join(packages) if packages else None,
+                language=language or "python",
+                timeout=timeout,
+                owner_user_id=owner_user_id,
             )
             db.add(job)
             db.commit()
             db.refresh(job)
-            
+
             self.schedule_job(job)
             return job
         finally:
