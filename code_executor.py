@@ -436,26 +436,105 @@ USER codeuser
     # (via published ports), bypassing `docker exec` on the hot path.
     # ------------------------------------------------------------------
 
+    # Image label key for the source-content hash. Written at `docker build`
+    # time and checked on every cold-start so a new deploy (different
+    # worker.py or Dockerfile) automatically rebuilds instead of reusing
+    # a stale cached image.
+    WORKER_HASH_LABEL = "supakiln.worker-hash"
+
+    @staticmethod
+    def _worker_source_hash(dockerfile_path: str) -> str:
+        """Hash worker.py + the runtime's Dockerfile — the inputs that bake
+        into a base image. Any edit to either invalidates cached images.
+
+        Short hash (12 chars) — collision risk is meaningless here since
+        the pool is tiny and a collision would only cause a spurious
+        cache hit that the next worker-source edit re-invalidates.
+        """
+        h = hashlib.sha256()
+        for path in ("workers/worker.py", dockerfile_path):
+            try:
+                with open(path, "rb") as f:
+                    h.update(f.read())
+            except OSError:
+                # Missing file → deterministic hash that won't match any
+                # previously-built image, forcing a rebuild (which will
+                # fail fast with a clearer error than a stale image).
+                h.update(f"__missing__{path}".encode())
+        return h.hexdigest()[:12]
+
+    def _image_worker_hash_label(self, tag: str) -> Optional[str]:
+        """Read the supakiln.worker-hash label off an existing image, or None
+        if the image doesn't exist / doesn't carry the label (e.g. built
+        by a prior supakiln version that didn't stamp it)."""
+        success, out, _ = self._run_docker_command([
+            "docker", "image", "inspect", tag,
+            "--format", "{{ index .Config.Labels \"" + self.WORKER_HASH_LABEL + "\" }}",
+        ])
+        if not success:
+            return None
+        val = (out or "").strip()
+        # `docker inspect` renders a missing label as "<no value>".
+        if not val or val == "<no value>":
+            return None
+        return val
+
+    def _remove_derived_images(self, base_tag: str) -> None:
+        """Delete `<name>:<anything-not-base>` images when the base is rebuilt.
+
+        Per-package images are built FROM the base tag but copy its layers
+        by hash at build time. Rebuilding the base doesn't re-parent them —
+        they keep pointing at the old base layer (and its old worker.py).
+        Nuke them so the next package-install path rebuilds cleanly.
+        """
+        base_name = base_tag.split(":", 1)[0]
+        success, out, _ = self._run_docker_command([
+            "docker", "images", base_name, "--format", "{{.Repository}}:{{.Tag}}",
+        ])
+        if not success or not out:
+            return
+        to_remove = [
+            t.strip() for t in out.splitlines()
+            if t.strip() and t.strip() != base_tag
+        ]
+        if not to_remove:
+            return
+        logger.info("Removing %d derived image(s) for %s: %s",
+                    len(to_remove), base_name, to_remove)
+        self._run_docker_command(["docker", "rmi", "-f", *to_remove])
+
     def _ensure_runtime_base_image(self, runtime: Runtime) -> None:
-        """Build the runtime's base image if it isn't already present.
+        """Build the runtime's base image if missing or stale.
 
         We always hit `docker image inspect` here — caching "ready=True"
         in-process lets an image get deleted externally (by `docker rmi`,
         GC, or a cleanup sweep) and leaves us with a stale Yes that
         fails on the next `docker run`. The inspect is ~5ms, cheap
         enough to do on the cold-start path.
+
+        Staleness detection: we hash worker.py + the Dockerfile, stamp
+        the result as a label at build time, and compare on every
+        check. A new deploy that changes either file gets picked up
+        automatically — no manual `docker rmi` step.
         """
         tag = runtime.base_image_tag
-        success, _, _ = self._run_docker_command(["docker", "image", "inspect", tag])
-        if success:
+        expected_hash = self._worker_source_hash(runtime.dockerfile_path)
+        existing_hash = self._image_worker_hash_label(tag)
+        if existing_hash == expected_hash:
             return
-        print(f"Building {tag} from {runtime.dockerfile_path}...")
+        reason = "missing" if existing_hash is None else f"stale ({existing_hash} -> {expected_hash})"
+        print(f"Building {tag} from {runtime.dockerfile_path} ({reason})...")
         success, _, error = self._run_docker_command(
-            ["docker", "build", "-t", tag, "-f", runtime.dockerfile_path, "."],
+            ["docker", "build",
+             "--label", f"{self.WORKER_HASH_LABEL}={expected_hash}",
+             "-t", tag, "-f", runtime.dockerfile_path, "."],
             timeout=600,
         )
         if not success:
             raise Exception(f"Failed to build {tag}: {error}")
+        # Base changed — derived per-package images now reference a stale
+        # layer. Clear them so the package-install path rebuilds.
+        self._remove_derived_images(tag)
 
     def _build_runtime_image(self, runtime: Runtime, packages: List[str]) -> str:
         """Return an image tag for `runtime + packages`, building if needed."""
