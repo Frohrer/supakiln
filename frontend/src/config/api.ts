@@ -26,6 +26,33 @@ const CF_CLIENT_ID = import.meta.env.VITE_CF_CLIENT_ID;
 const CF_CLIENT_SECRET = import.meta.env.VITE_CF_CLIENT_SECRET;
 const CF_ACCESS_TOKEN = import.meta.env.VITE_CF_ACCESS_TOKEN;
 
+// -------------------------------------------------------------------
+// Supakiln bearer-token auth. Persisted in localStorage so reloads
+// keep the user logged in. The AuthContext is the source of truth for
+// *who* the user is; this module just ferries the token into request
+// headers and clears it on 401.
+// -------------------------------------------------------------------
+
+const TOKEN_STORAGE_KEY = 'supakiln_token';
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_STORAGE_KEY);
+}
+
+export function setToken(token: string): void {
+  localStorage.setItem(TOKEN_STORAGE_KEY, token);
+}
+
+export function clearToken(): void {
+  localStorage.removeItem(TOKEN_STORAGE_KEY);
+}
+
+// When a response comes back 401 mid-session, we dispatch this event
+// so the AuthContext can react (drop the user, show the login page).
+// Using a browser event avoids a circular import between api.ts and
+// AuthContext.tsx.
+export const AUTH_UNAUTHORIZED_EVENT = 'supakiln:unauthorized';
+
 // Create axios instance with Cloudflare Access configuration
 export const api = axios.create({
   baseURL: API_URL,
@@ -46,10 +73,16 @@ export const api = axios.create({
 // Enhanced request interceptor
 api.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
-    // Add dynamic headers
-    const token = localStorage.getItem('cf_access_token');
-    if (token && config.headers) {
-      config.headers['CF-Access-Token'] = token;
+    // Supakiln bearer token (from localStorage via auth context).
+    const supaToken = getToken();
+    if (supaToken && config.headers) {
+      config.headers['Authorization'] = `Bearer ${supaToken}`;
+    }
+
+    // Legacy Cloudflare Access header (if set by the deployment).
+    const cfToken = localStorage.getItem('cf_access_token');
+    if (cfToken && config.headers) {
+      config.headers['CF-Access-Token'] = cfToken;
     }
 
     // Add CSRF token if available
@@ -57,12 +90,6 @@ api.interceptors.request.use(
     if (csrfToken && config.headers) {
       config.headers['X-CSRF-Token'] = csrfToken;
     }
-
-    // Log request for debugging
-    console.log(`Making ${config.method?.toUpperCase()} request to ${config.url}`, {
-      headers: config.headers,
-      hasCloudflareAuth: !!(CF_CLIENT_ID && CF_CLIENT_SECRET),
-    });
 
     return config;
   },
@@ -82,6 +109,18 @@ api.interceptors.response.use(
     if (error.response?.status === 403 && error.response?.headers?.['cf-ray']) {
       console.warn('Cloudflare Access authentication failed');
       // Optionally redirect to Cloudflare Access login or show error message
+    }
+
+    // Supakiln 401: notify the AuthContext so the UI can drop the
+    // user and route to /login. We skip this for /auth/login itself
+    // since that's the user mistyping their password, not a session
+    // problem.
+    if (
+      error.response?.status === 401 &&
+      !(error.config?.url || '').includes('/auth/login')
+    ) {
+      clearToken();
+      window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT));
     }
     
     // Enhanced error logging and processing for better frontend error handling
